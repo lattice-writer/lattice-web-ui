@@ -21,6 +21,8 @@
 // 9. "Phone and app": how to open the workspace on a phone, install it as an
 //    app, and manage paired devices, as a dialog built from Lattice's own
 //    Settings parts.
+// 10. The workspace fills the screen under a phone's status bar, keeps its
+//     content in the safe area, and paints the strip in the colour at the top.
 (() => {
   "use strict";
 
@@ -659,6 +661,36 @@
     };
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
     else start();
+  })();
+
+  // The workspace fills the screen, under the status bar too. Lattice's page
+  // stops at the safe area, and iOS shows the top of the page blurred under
+  // the status bar, which an open iPhone Duo or an iPad keeps in landscape.
+  // With viewport-fit=cover, Lattice's root keeps its content inside the safe
+  // area, and the strip under the status bar is painted in the colour of what
+  // is at the top of the page. Where there is no safe area, nothing changes.
+  (() => {
+    const style = document.createElement("style");
+    style.dataset.latticeGateway = "safe-area";
+    style.textContent = `
+      #root { padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
+      #root:has(.titlebar) { background: linear-gradient(var(--surface-titlebar) env(safe-area-inset-top, 0px), var(--surface-window) 0); }
+      #root:has(.titlebar.titlebar-focus) { background: linear-gradient(var(--surface-shell) env(safe-area-inset-top, 0px), var(--surface-window) 0); }
+      #root:has(.welcome-screen) { background: var(--surface-backdrop); }
+    `;
+    // Lattice's viewport tag comes later in the head than this script.
+    const cover = () => {
+      const meta = document.querySelector('meta[name="viewport"]');
+      if (!meta) return false;
+      if (!/viewport-fit/.test(meta.content)) meta.content = `${meta.content}, viewport-fit=cover`;
+      return true;
+    };
+    if (!cover()) {
+      const watch = new MutationObserver(() => { if (cover()) watch.disconnect(); });
+      watch.observe(document.documentElement, { childList: true, subtree: true });
+      document.addEventListener("DOMContentLoaded", () => { watch.disconnect(); cover(); }, { once: true });
+    }
+    document.head.append(style);
   })();
 
   // "Phone and app", for the owner. It uses Lattice's own modal, Settings
