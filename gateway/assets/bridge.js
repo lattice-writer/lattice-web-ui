@@ -23,6 +23,9 @@
 //    Settings parts.
 // 10. The workspace fills the screen under a phone's status bar, keeps its
 //     content in the safe area, and paints the strip in the colour at the top.
+// 11. A project held by a Lattice window on the host's own display, which
+//     nobody can see, is opened in the tab: that window is closed first. A tab
+//     cannot hand its workspace to that display ("Open in Lattice app").
 (() => {
   "use strict";
 
@@ -54,6 +57,49 @@
     throw new Error(value?.error?.message || "Installing the TeX package failed.");
   }
 
+  // A Lattice window on the host's own display is one nobody can see. When
+  // the project asked for is shown in one, Lattice would only focus it, and
+  // the tab would stay where it was. That window is closed the way Lattice
+  // closes a window (it saves first), so the project opens in the tab.
+  const zh = () => /^zh/i.test(document.documentElement.lang || navigator.language || "");
+  const noDesktopMessage = () => zh()
+    ? "这台主机上的 Lattice 应用没有能看到的屏幕，工作区留在这个标签页里。"
+    : "The Lattice app on this host has no screen anyone can see, so the workspace stays in this tab.";
+  let lastRelease = { path: null, at: 0 };
+  async function hiddenWindowHolding(invoke, path) {
+    if (typeof path !== "string" || !path) return null;
+    const labels = await invoke("plugin:window|get_all_windows").catch(() => null);
+    if (!Array.isArray(labels)) return null;
+    // A window's title starts with its project's name: Lattice's own, or the folder's.
+    const names = [String(path).replace(/\/+$/, "").split("/").pop()];
+    try {
+      const listed = JSON.parse(localStorage.getItem(RECENT) || "[]").find((item) => item?.path === path);
+      if (typeof listed?.name === "string") names.unshift(listed.name);
+    } catch { /* the folder's name is enough */ }
+    for (const label of labels) {
+      // Browser tabs' hosts and PDF windows never hold a project.
+      if (typeof label !== "string" || label.startsWith("browser-") || label.startsWith("pdf-")) continue;
+      const title = await invoke("plugin:window|title", { label }).catch(() => null);
+      if (typeof title === "string" && names.some((name) => name && (title === name || title.startsWith(`${name} — `)))) return label;
+    }
+    return null;
+  }
+  async function releaseFromHiddenWindow(invoke, path) {
+    // Tried a moment ago (the window would not close): Lattice answers as it would.
+    if (lastRelease.path === path && Date.now() - lastRelease.at < 20000) return false;
+    const label = await hiddenWindowHolding(invoke, path);
+    if (!label) return false;
+    lastRelease = { path, at: Date.now() };
+    try { await invoke("plugin:window|close", { label }); } catch { return false; }
+    for (let i = 0; i < 50; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const shown = await invoke("project_shown_elsewhere", { path }).catch(() => null);
+      if (shown === false) { lastRelease = { path: null, at: 0 }; return true; }
+      if (shown === null) return false;
+    }
+    return false;
+  }
+
   // Lattice installs its IPC adapter on window.__TAURI_INTERNALS__; wrap its invoke as it arrives.
   let internals;
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
@@ -65,6 +111,27 @@
         value.invoke = async (command, args, options) => {
           if (command === "start_tex_dependency_install") {
             return installTexDependency(args, () => invoke(command, args, options));
+          }
+          // The Lattice app on the host has no screen anyone sees: the workspace stays in the tab.
+          if (command === "return_to_desktop") throw noDesktopMessage();
+          if (command === "project_shown_elsewhere") {
+            const shown = await invoke(command, args, options);
+            return shown === true && await releaseFromHiddenWindow(invoke, args?.path) ? false : shown;
+          }
+          if (command === "open_project") {
+            // Reopening the last project when the page loads asks Lattice directly.
+            try {
+              return await invoke(command, args, options);
+            } catch (error) {
+              if (!/already open in another Lattice window/.test(String(error?.message ?? error))
+                || !await releaseFromHiddenWindow(invoke, args?.path)) throw error;
+              return invoke(command, args, options);
+            }
+          }
+          if (command === "open_project_window") {
+            const shown = await invoke("project_shown_elsewhere", { path: args?.path }).catch(() => false);
+            if (shown === true) await releaseFromHiddenWindow(invoke, args?.path);
+            return invoke(command, args, options);
           }
           // Lattice reaches this host through lattice-web-ui's release, never a download.
           if (command === "check_linux_release") return null;
