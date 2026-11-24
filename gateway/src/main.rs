@@ -13,6 +13,8 @@
 mod agent;
 mod app;
 mod bridge;
+mod compress;
+mod downloads;
 mod proxy;
 mod store;
 mod tex;
