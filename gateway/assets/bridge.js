@@ -26,6 +26,9 @@
 // 11. A project held by a Lattice window on the host's own display, which
 //     nobody can see, is opened in the tab: that window is closed first. A tab
 //     cannot hand its workspace to that display ("Open in Lattice app").
+// 12. "Save … as" (a PDF, a review copy, a project archive) downloads the file
+//     to this device, instead of asking for a place on the host's disk in a
+//     panel on its display.
 (() => {
   "use strict";
 
@@ -100,6 +103,48 @@
     return false;
   }
 
+  // Lattice's save panel would open on the host's display, which nobody sees,
+  // and the file would stay on the host. The gateway gives a fresh folder for
+  // the file instead; the command that writes it there names that path (in its
+  // arguments, or base64 in a header for binary saves), and once it returns
+  // the tab downloads the file.
+  const downloads = [];
+  const base64 = (text) => btoa(Array.from(new TextEncoder().encode(text), (b) => String.fromCharCode(b)).join(""));
+  async function downloadDestination(args) {
+    const options = args?.options || {};
+    let name = String(options.defaultPath || "").split(/[\\/]/).pop() || "download";
+    const extension = options.filters?.[0]?.extensions?.[0];
+    if (extension && extension !== "*" && !name.toLowerCase().endsWith(`.${extension.toLowerCase()}`)) name += `.${extension}`;
+    const response = await fetch("/__gateway/api/download", {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }),
+    });
+    if (!response.ok) throw new Error(`download ${response.status}`);
+    const { id, path } = await response.json();
+    downloads.push({ id, path, encoded: base64(path), at: Date.now() });
+    return path;
+  }
+  function downloadWrittenBy(args, options) {
+    for (let i = downloads.length - 1; i >= 0; i--) if (Date.now() - downloads[i].at > 30 * 60 * 1000) downloads.splice(i, 1);
+    if (!downloads.length) return null;
+    const values = [];
+    if (args && typeof args === "object" && !ArrayBuffer.isView(args) && !(args instanceof ArrayBuffer)) values.push(...Object.values(args));
+    const headers = options?.headers;
+    if (headers instanceof Headers) values.push(...headers.values());
+    else if (headers && typeof headers === "object") values.push(...Object.values(headers));
+    const index = downloads.findIndex((d) => values.some((v) => v === d.path || v === d.encoded));
+    return index < 0 ? null : downloads.splice(index, 1)[0];
+  }
+  function startDownload({ id, path }) {
+    const link = document.createElement("a");
+    link.href = `/__gateway/download/${id}`;
+    link.download = path.split("/").pop();
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+  }
+
   // Lattice installs its IPC adapter on window.__TAURI_INTERNALS__; wrap its invoke as it arrives.
   let internals;
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
@@ -132,6 +177,17 @@
             const shown = await invoke("project_shown_elsewhere", { path: args?.path }).catch(() => false);
             if (shown === true) await releaseFromHiddenWindow(invoke, args?.path);
             return invoke(command, args, options);
+          }
+          if (command === "plugin:dialog|save") {
+            // Nothing chosen (as if cancelled) rather than a panel nobody sees.
+            return downloadDestination(args).catch(() => null);
+          }
+          const download = downloadWrittenBy(args, options);
+          if (download) {
+            const result = await invoke(command, args, options);
+            startDownload(download);
+            // Lattice says "Saved to <path>": the path on the host means nothing here.
+            return result === download.path ? download.path.split("/").pop() : result;
           }
           // Lattice reaches this host through lattice-web-ui's release, never a download.
           if (command === "check_linux_release") return null;

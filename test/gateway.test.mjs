@@ -169,7 +169,8 @@ test("pairs a device once, tunnels its WebSocket, and cuts it off on revoke", { 
 test("adapts Lattice's page to the public origin and counts each rewrite", { skip }, async () => {
   const owner = cookieOf(await post("/__gateway/api/login", { token }));
   const html = await (await fetch(`${base}/`, { headers: { Cookie: owner } })).text();
-  assert.match(html, /<head><script src="\/__gateway\/bridge\.js"><\/script><script type="module"/);
+  assert.match(html, /<head><script src="\/__gateway\/bridge\.js"><\/script><link rel="icon"/);
+  assert.match(html, /data-lattice-gateway="brand"><script type="module"/);
   const script = await fetch(`${base}/assets/app.js`, { headers: { Cookie: owner, "Accept-Encoding": "gzip" } });
   assert.equal(script.headers.get("etag"), null, "a rewritten script drops Lattice's ETag");
   const text = await script.text();

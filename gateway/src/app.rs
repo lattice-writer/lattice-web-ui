@@ -93,6 +93,10 @@ pub struct App {
     updates: Option<crate::update::Updates>,
     /// Present once the owner has answered the phone hint.
     phone_hint: std::path::PathBuf,
+    /// Gzip and conditional answers for whatever goes out.
+    encoder: crate::compress::Encoder,
+    /// Files tabs save, handed to the device as downloads.
+    downloads: crate::downloads::Downloads,
 }
 
 /// The Lattice workspaces browser tabs hold through the gateway.
@@ -321,6 +325,8 @@ impl App {
             last_workspace: LastWorkspace::default(),
             updates: args.update_dir.clone().map(crate::update::Updates::new),
             phone_hint: args.state_dir.join("phone-hint-answered"),
+            encoder: Default::default(),
+            downloads: crate::downloads::Downloads::new(args.state_dir.join("downloads")),
             tex: args.tlmgr.clone().map(|tlmgr| crate::tex::Tex {
                 tlmgr,
                 dry_run: args.tlmgr_dry_run,
@@ -459,7 +465,14 @@ fn page(name: &str, origin: &str) -> Response<Body> {
 }
 
 fn asset(content_type: &'static str, body: impl Into<bytes::Bytes>) -> Response<Body> {
+    let body: bytes::Bytes = body.into();
+    // "no-cache" revalidates on every load; the tag lets that be a 304.
+    let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&body));
+    let tag = format!("\"{}\"", &digest[..16]);
     let mut response = Response::new(full(body));
+    if let Ok(tag) = HeaderValue::from_str(&tag) {
+        response.headers_mut().insert(header::ETAG, tag);
+    }
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -553,6 +566,19 @@ fn qr_svg(text: &str) -> String {
 }
 
 async fn handle(app: Arc<App>, entrance: Entrance, req: Request<Incoming>) -> Response<Body> {
+    let key = format!(
+        "{entrance:?}{}",
+        req.uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+    );
+    let asked = crate::compress::Asked::from(key, req.method(), req.headers());
+    let response = route(app.clone(), entrance, req).await;
+    app.encoder.finish(asked, response).await
+}
+
+async fn route(app: Arc<App>, entrance: Entrance, req: Request<Incoming>) -> Response<Body> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     let principal = app.principal(entrance, req.headers());
@@ -580,6 +606,12 @@ async fn handle(app: Arc<App>, entrance: Entrance, req: Request<Incoming>) -> Re
         }
         (_, &Method::GET, "/__gateway/brand/icon-512.png") => {
             return asset("image/png", BRAND_ICON_512)
+        }
+        // Browsers ask for these at the root on their own; Lattice would answer
+        // with its icon (or its page).
+        (_, &Method::GET, "/favicon.ico") => return asset("image/png", BRAND_FAVICON),
+        (_, &Method::GET, "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png") => {
+            return asset("image/png", BRAND_TOUCH)
         }
         (_, &Method::GET, "/__gateway/brand/apple-touch-icon.png") => {
             return asset("image/png", BRAND_TOUCH)
@@ -706,6 +738,47 @@ async fn handle(app: Arc<App>, entrance: Entrance, req: Request<Incoming>) -> Re
                 );
             }
             return api(app.clone(), entrance, principal, p.to_string(), req).await;
+        }
+        (&Method::GET, p)
+            if p.starts_with("/__gateway/download/") && entrance == Entrance::Public =>
+        {
+            if principal.is_none() {
+                return error(
+                    StatusCode::UNAUTHORIZED,
+                    "sign_in_required",
+                    "Sign in to download.",
+                );
+            }
+            let id = p["/__gateway/download/".len()..].to_string();
+            let Some(saved) = app.downloads.take(&id) else {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "That download is not there.",
+                );
+            };
+            {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(crate::downloads::KEEP_AFTER_FETCH).await;
+                    app.downloads.forget(&id);
+                });
+            }
+            let mut response = Response::new(full(saved.bytes));
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(crate::downloads::content_type(&saved.name)),
+            );
+            if let Ok(value) = HeaderValue::from_str(&crate::downloads::disposition(&saved.name)) {
+                headers.insert(header::CONTENT_DISPOSITION, value);
+            }
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            headers.insert(
+                "x-content-type-options",
+                HeaderValue::from_static("nosniff"),
+            );
+            return response;
         }
         (&Method::GET, "/__gateway/api/update") => {
             if principal != Some(Principal::Owner) {
@@ -1091,6 +1164,24 @@ async fn api(
                     *response.status_mut() = StatusCode::NO_CONTENT;
                     response
                 }
+            }
+        }
+        "/__gateway/api/download" if entrance == Entrance::Public && principal.is_some() => {
+            let body = match read_json(req).await {
+                Ok(v) => v,
+                Err(r) => return *r,
+            };
+            let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+            match app.downloads.destination(name) {
+                Ok((id, path)) => json_response(
+                    StatusCode::OK,
+                    json!({ "id": id, "path": path.to_string_lossy() }),
+                ),
+                Err(message) => error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "download_failed",
+                    &message,
+                ),
             }
         }
         "/__gateway/api/phone/hint" if owner => match fs::write(&app.phone_hint, b"") {

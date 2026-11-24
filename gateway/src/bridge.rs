@@ -95,14 +95,34 @@ pub fn record(counters: &Counters, counts: [u64; 5]) {
     }
 }
 
-/// Load the gateway's page script before Lattice's own scripts.
+/// lattice-web-ui's name and icons, in the page as it arrives: Safari and the
+/// home screen read them from the HTML, before any script runs. bridge.js
+/// keeps them (it leaves links marked `data-lattice-gateway` alone).
+const BRAND_HEAD: &str = concat!(
+    r#"<link rel="icon" type="image/svg+xml" href="/__gateway/brand/logo.svg" data-lattice-gateway="brand">"#,
+    r#"<link rel="icon" type="image/png" sizes="32x32" href="/__gateway/brand/favicon-32.png" data-lattice-gateway="brand">"#,
+    r#"<link rel="apple-touch-icon" href="/__gateway/brand/apple-touch-icon.png" data-lattice-gateway="brand">"#,
+    r#"<link rel="manifest" href="/__gateway/brand/manifest.webmanifest" data-lattice-gateway="brand">"#,
+    r#"<meta name="apple-mobile-web-app-title" content="Lattice-web-ui" data-lattice-gateway="brand">"#,
+);
+
+/// Load the gateway's page script before Lattice's own scripts, and put
+/// lattice-web-ui's name and icons in place of Lattice's.
 pub fn inject_html(html: &str) -> Option<String> {
+    static LATTICE_ICONS: OnceLock<Regex> = OnceLock::new();
+    let icons = LATTICE_ICONS.get_or_init(|| {
+        Regex::new(r#"(?i)\s*<link\b[^>]*\brel=["']?(?:shortcut icon|icon|apple-touch-icon(?:-precomposed)?|manifest)["'\s>][^>]*>"#)
+            .expect("valid pattern")
+    });
     let tag = r#"<script src="/__gateway/bridge.js"></script>"#;
     let at = html.find("<head>").map(|i| i + "<head>".len())?;
-    let mut out = String::with_capacity(html.len() + tag.len());
+    let rest = icons.replace_all(&html[at..], "");
+    let rest = rest.replacen("<title>Lattice</title>", "<title>Lattice-web-ui</title>", 1);
+    let mut out = String::with_capacity(html.len() + tag.len() + BRAND_HEAD.len());
     out.push_str(&html[..at]);
     out.push_str(tag);
-    out.push_str(&html[at..]);
+    out.push_str(BRAND_HEAD);
+    out.push_str(&rest);
     Some(out)
 }
 
@@ -149,7 +169,33 @@ mod tests {
     fn injects_the_page_script_first() {
         let html = "<!doctype html><html><head><script type=\"module\" src=\"/assets/app.js\"></script></head></html>";
         let out = inject_html(html).unwrap();
-        assert!(out.starts_with("<!doctype html><html><head><script src=\"/__gateway/bridge.js\"></script><script type=\"module\""));
+        assert!(out.starts_with("<!doctype html><html><head><script src=\"/__gateway/bridge.js\"></script><link rel=\"icon\""));
+        assert!(out.contains("brand\"><script type=\"module\" src=\"/assets/app.js\">"));
         assert!(inject_html("<html></html>").is_none());
+    }
+
+    #[test]
+    fn puts_lattice_web_uis_name_and_icons_in_place_of_lattices() {
+        // Lattice 0.19.0's page head, as its browser host serves it.
+        let html = concat!(
+            "<!DOCTYPE html><html lang=\"en\"><head>\n",
+            "    <meta charset=\"UTF-8\">\n",
+            "    <meta name=\"theme-color\" content=\"#171718\">\n",
+            "    <link rel=\"icon\" type=\"image/svg+xml\" href=\"/assets/app-icon-Dp3s_p_l.svg\">\n",
+            "    <title>Lattice</title>\n",
+            "    <link rel=\"modulepreload\" crossorigin=\"\" href=\"/assets/ui-Ds96uiLR.js\">\n",
+            "</head></html>",
+        );
+        let out = inject_html(html).unwrap();
+        assert!(!out.contains("app-icon-Dp3s_p_l.svg"));
+        assert!(out.contains("<title>Lattice-web-ui</title>"));
+        assert!(out.contains(
+            r#"<link rel="apple-touch-icon" href="/__gateway/brand/apple-touch-icon.png""#
+        ));
+        assert!(out.contains(
+            r#"<link rel="modulepreload" crossorigin="" href="/assets/ui-Ds96uiLR.js">"#
+        ));
+        assert_eq!(out.matches("rel=\"icon\"").count(), 2);
+        assert!(out.contains("<meta name=\"theme-color\""));
     }
 }
