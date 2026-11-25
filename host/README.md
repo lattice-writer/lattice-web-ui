@@ -168,6 +168,12 @@ owner sees it in the workspace as a Lattice notification: **Lattice-web-ui
   **Update to 0.9.1** beside Lattice's own buttons, whatever happened to the
   notification. Select it to bring the notification back. On a phone it is a
   round button in the bottom corner.
+- **Settings › Lattice-web-ui › Version.** A page of Lattice's Settings with
+  the versions this host runs, **Check for updates** (the
+  `lattice-update-check.path` unit runs the check at once), **Update to …**,
+  and what each newer release brings, from its release notes. The same row
+  stands in for Lattice's own **App updates › Version** under Editor &
+  builds, which would say Lattice on Linux doesn't update itself.
 
 Paired devices see none of this. Only a host installed from a release kit
 updates itself this way. The kit it runs is kept in

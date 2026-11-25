@@ -189,6 +189,7 @@ class HostKitTest(unittest.TestCase):
         for unit in self.tool.UPDATE_FILES:
             self.assertTrue((units / unit).exists(), unit)
         self.assertIn(f"PathExists={self.root / 'state/update/request'}", (units / "lattice-update.path").read_text())
+        self.assertIn(f"PathExists={self.root / 'state/update/check'}", (units / "lattice-update-check.path").read_text())
         self.assertIn(f"{self.root / 'kit/lattice-host'} --root {self.root} self-update", (units / "lattice-update.service").read_text())
         self.assertIn(f"--update-dir {self.root / 'state/update'}", (units / "lattice-gateway.service").read_text())
 
@@ -260,9 +261,16 @@ class SelfUpdateTest(unittest.TestCase):
         files[f"/dl/{name}"] = archive + (b"x" if tamper else b"")
         files[f"/dl/SHA256SUMS-{tag}.txt"] = f"{digest}  {name}\n".encode()
         files[f"/dl/release-{tag}.json"] = json.dumps({"lattice": {"default": "0.20.0"}, "assets": {name: digest}}).encode()
-        files["/api/releases/latest"] = json.dumps({"tag_name": tag, "assets": [
-            {"name": n, "browser_download_url": f"{self.server.base}/dl/{n}"}
-            for n in (name, f"SHA256SUMS-{tag}.txt", f"release-{tag}.json")]}).encode()
+        release = {"tag_name": tag, "html_url": f"https://github.com/lattice-writer/lattice-web-ui/releases/tag/{tag}",
+                   "published_at": "2026-11-24T22:46:04Z",
+                   "body": f"## Changes\n\n- Release {version}: the version page (#42) (fac9233)\n- A version page in Settings (#41) (dd1fc14)\n\nBuild verification: x\n",
+                   "assets": [{"name": n, "browser_download_url": f"{self.server.base}/dl/{n}"}
+                              for n in (name, f"SHA256SUMS-{tag}.txt", f"release-{tag}.json")]}
+        files["/api/releases/latest"] = json.dumps(release).encode()
+        files["/api/releases?per_page=30"] = json.dumps([release,
+            {"tag_name": "v0.8.9", "body": "- Between (#30) (aaaaaaa)"},
+            {"tag_name": "v0.9.5", "prerelease": True, "body": "- Not stable"},
+            {"tag_name": "v0.8.3", "body": "- Already here"}]).encode()
 
     def run_tool(self, *argv):
         return self.tool.main(["--root", str(self.root), *argv])
@@ -279,6 +287,28 @@ class SelfUpdateTest(unittest.TestCase):
         self.assertEqual((found["latest"], found["current"], found["lattice"]), ("0.9.0", "0.8.3", {"current": "0.19.0", "latest": "0.20.0"}))
         self.assertEqual(stat.S_IMODE((self.root / "state/update/available.json").stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.root / "state/update").stat().st_mode), 0o700)
+
+    def test_check_update_lists_what_each_newer_version_brings(self):
+        self.assertEqual(self.run_tool("check-update"), 0)
+        releases = self.state("available.json")["releases"]
+        self.assertEqual([r["version"] for r in releases], ["0.9.0", "0.8.9"], "stable, newer than 0.8.3, newest first")
+        self.assertEqual(releases[0]["changes"], ["A version page in Settings (#41)"])
+        self.assertEqual(releases[0]["url"], "https://github.com/lattice-writer/lattice-web-ui/releases/tag/v0.9.0")
+        self.assertEqual(releases[1]["url"], "")
+
+    def test_check_now_is_answered_and_a_failure_is_recorded(self):
+        folder = self.root / "state/update"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "check").write_text("1")
+        self.assertEqual(self.run_tool("check-update"), 0)
+        self.assertFalse((folder / "check").exists(), "the request is answered")
+        self.assertFalse((folder / "check-failed.json").exists())
+        del self.server.files["/api/releases/latest"]
+        (folder / "check").write_text("1")
+        self.assertNotEqual(self.run_tool("check-update"), 0)
+        self.assertFalse((folder / "check").exists(), "a failed run does not ask again")
+        self.assertIn("404", self.state("check-failed.json")["error"])
+        self.assertEqual(self.state("available.json")["latest"], "0.9.0", "the last answer stays")
 
     def test_self_update_installs_the_requested_kit(self):
         self.assertEqual(self.run_tool("check-update"), 0)

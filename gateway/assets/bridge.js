@@ -16,6 +16,8 @@
 // 7. The owner sees a new lattice-web-ui release as one of Lattice's own
 //    notifications, and can update the host from it. Lattice's own "new Linux
 //    version" notice is answered with nothing: lattice-web-ui pins Lattice.
+//    Settings has a Version page too: the versions this host runs, what each
+//    newer release brings, Update, and Check now.
 // 8. The workspace carries lattice-web-ui's name and icon: in the browser tab,
 //    on a phone's home screen, and on Lattice's welcome screen.
 // 9. "Phone and app": how to open the workspace on a phone, install it as an
@@ -244,8 +246,8 @@
   let replaced = false;
   function reclaim(event) {
     if (!replaced || (event && event.isTrusted === false)) return;
-    // Phone and app talks to the gateway only; using it leaves the workspace where it is.
-    if (event?.target?.closest?.('[data-lattice-gateway="phone"], [data-lattice-gateway="phone-backdrop"]')) return;
+    // Phone and app and Version talk to the gateway only; using them leaves the workspace where it is.
+    if (event?.target?.closest?.("[data-gateway-dialog], [data-gateway-dialog-backdrop], [data-gateway-page]")) return;
     if (event?.type === "visibilitychange" && document.visibilityState !== "visible") return;
     if (event?.type === "focus" && event.target !== window) return;
     if (event?.cancelable) { event.preventDefault(); event.stopImmediatePropagation(); }
@@ -409,18 +411,21 @@
   // Lattice-style notifications, shared by the update prompt and the phone hint.
   const toastApi = { show: () => {}, close: () => {}, busy: () => false };
   let openPhoneGuide = () => {};
+  // The update prompt's state and its Update, shared with the Version page.
+  const updateApi = { state: null, start: () => {}, apply: () => {}, listeners: new Set() };
+  // Lattice's interface language: its saved choice, else the browser's.
+  const zhUI = (() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("lattice.appearance.v5") || "{}").interfaceLanguage;
+      if (saved === "zh-CN" || saved === "en") return saved === "zh-CN";
+    } catch { /* fall back to the browser */ }
+    return /^zh\b/i.test(navigator.language || "");
+  })();
 
   // The owner's update prompt, built from the markup and classes of Lattice's
   // own notifications (src/telemetry/toast-stack.tsx), so it looks like one.
   (() => {
-    const zh = (() => {
-      try {
-        const saved = JSON.parse(localStorage.getItem("lattice.appearance.v5") || "{}").interfaceLanguage;
-        if (saved === "zh-CN" || saved === "en") return saved === "zh-CN";
-      } catch { /* fall back to the browser */ }
-      return /^zh\b/i.test(navigator.language || "");
-    })();
-    const T = zh ? {
+    const T = zhUI ? {
       available: (v) => `Lattice-web-ui ${v} 可以更新`,
       brings: (l) => `包含 Lattice ${l}。`,
       takes: "更新约一分钟，期间工作区会重新连接。",
@@ -699,21 +704,30 @@
       tick();
     }
 
+    // `quiet`: the owner is looking at the Version page, which shows the offer itself.
+    function apply(state, quiet = false) {
+      updateApi.state = state;
+      for (const listener of updateApi.listeners) listener(state);
+      if (following) return;
+      if (state.running) {
+        hideChip();
+        follow(state.status?.target || state.latest);
+      } else if (state.available) {
+        showChip(state);
+        if (!state.dismissed && !quiet) offer(state);
+      } else {
+        hideChip();
+      }
+    }
+    updateApi.apply = (state) => apply(state, true);
+    updateApi.start = start;
+
     async function check() {
       if (following) return;
       try {
         const response = await api("/__gateway/api/update");
         if (!response.ok) return;
-        const state = await response.json();
-        if (state.running) {
-          hideChip();
-          follow(state.status?.target || state.latest);
-        } else if (state.available) {
-          showChip(state);
-          if (!state.dismissed) offer(state);
-        } else {
-          hideChip();
-        }
+        apply(await response.json());
       } catch { /* the next check retries */ }
     }
     fetch("/__gateway/api/whoami", { credentials: "same-origin", cache: "no-store" })
@@ -843,7 +857,7 @@
     };
     const button = (label, variant, onclick) =>
       el("button", { type: "button", class: `ui-button ui-button--${variant}`, "data-slot": "button", onclick }, label);
-    const row = (label, description, ...control) => el("div", { class: "ui-settings-row ui-row", "data-slot": "settings-row" },
+    const row = (label, description, ...control) => el("div", { class: "ui-row ui-row--data ui-settings-row", "data-slot": "settings-row" },
       el("div", { class: "ui-settings-row-copy" },
         el("span", { class: "ui-settings-row-label" }, label),
         description ? el("p", { class: "ui-settings-row-description" }, description) : null),
@@ -865,26 +879,60 @@
     const style = document.createElement("style");
     style.dataset.latticeGateway = "phone-style";
     style.textContent = `
-      [data-lattice-gateway="phone"] .settings-modal { width: min(640px, calc(100vw - 32px)); height: auto; max-height: min(760px, calc(100dvh - 48px)); display: flex; flex-direction: column; background: var(--surface-panel); }
-      [data-lattice-gateway="phone"] { outline: none; }
-      [data-lattice-gateway="phone"], [data-lattice-gateway="phone-backdrop"] { z-index: 2147483647; }
-      [data-lattice-gateway="phone"] .settings-content { overflow-y: auto; overscroll-behavior: contain; }
-      [data-lattice-gateway="phone"] .settings-section { max-width: none; }
-      [data-lattice-gateway="phone"] .phone-qr { width: 104px; height: 104px; padding: 6px; border-radius: var(--radius-control); background: #fff; image-rendering: pixelated; }
-      [data-lattice-gateway="phone"] .phone-qr.large { width: 168px; height: 168px; }
-      [data-lattice-gateway="phone"] .phone-address { font-family: var(--mono-font, ui-monospace, monospace); overflow-wrap: anywhere; }
-      [data-lattice-gateway="phone"] .phone-badge { margin-inline-start: var(--space-3); padding: 1px 6px; border-radius: 999px; background: var(--control-active-soft); color: var(--control-active); font-size: var(--type-micro-size, 11px); font-weight: var(--weight-semibold, 600); vertical-align: 1px; }
-      [data-lattice-gateway="phone"] .phone-pair { display: grid; justify-items: center; gap: var(--space-4); padding-block: var(--space-6); text-align: center; color: var(--text-secondary); font-size: var(--type-caption-size); }
-      @media (max-width: 560px) { [data-lattice-gateway="phone"] .settings-modal { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); } }
+      [data-gateway-dialog] .settings-modal { width: min(640px, calc(100vw - 32px)); height: auto; max-height: min(760px, calc(100dvh - 48px)); display: flex; flex-direction: column; background: var(--surface-panel); }
+      [data-gateway-dialog] { outline: none; }
+      [data-gateway-dialog], [data-gateway-dialog-backdrop] { z-index: 2147483647; }
+      [data-gateway-dialog] .settings-content { overflow-y: auto; overscroll-behavior: contain; }
+      [data-gateway-dialog] .settings-section { max-width: none; }
+      [data-gateway-page] .phone-badge { margin-inline-start: var(--space-3); padding: 1px 6px; border-radius: 999px; background: var(--control-active-soft); color: var(--control-active); font-size: var(--type-micro-size, 11px); font-weight: var(--weight-semibold, 600); vertical-align: 1px; }
+      [data-gateway-page="version"] .version-date { margin-inline-start: var(--space-3, 6px); color: var(--text-tertiary); font-weight: normal; }
+      [data-gateway-page="version"] .version-changes { margin: var(--space-2, 4px) 0 0; padding-inline-start: 1.1em; color: var(--text-secondary); font-size: var(--type-caption-size, 12px); line-height: 1.55; }
+      [data-gateway-page="version"] .version-changes li::marker { color: var(--text-tertiary); }
+      [data-gateway-page="version"] .version-external { display: inline-flex; margin-inline-start: 4px; }
+      [data-gateway-page] a.ui-button, [data-gateway-page] a.ui-icon-button, [data-lattice-gateway="version-row"] a { text-decoration: none; }
+      /* Settings' pane shows the gateway's page in place of Lattice's. */
+      .settings-modal[data-gateway-page] .settings-content [data-slot="scroll-area-content"] > :not(.settings-back):not([data-gateway-page]) { display: none; }
+      .settings-modal[data-gateway-page] .settings-nav-group:not([data-lattice-gateway]) > button.active:not(:hover) { background: transparent; color: var(--text-secondary); font-weight: inherit; }
+      [data-gateway-page="phone"] .phone-qr { width: 104px; height: 104px; padding: 6px; border-radius: var(--radius-control); background: #fff; image-rendering: pixelated; }
+      [data-gateway-page="phone"] .phone-qr.large { width: 168px; height: 168px; }
+      [data-gateway-page="phone"] .phone-address { font-family: var(--mono-font, ui-monospace, monospace); overflow-wrap: anywhere; }
+      [data-gateway-page="phone"] .phone-pair { display: grid; justify-items: center; gap: var(--space-4); padding-block: var(--space-6); text-align: center; color: var(--text-secondary); font-size: var(--type-caption-size); }
+      @media (max-width: 560px) { [data-gateway-dialog] .settings-modal { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); } }
     `;
 
     let open = null;
+    let closed = null;
     function close() {
       open?.forEach((node) => node.remove());
       open = null;
+      closed?.();
+      closed = null;
+      removeEventListener("keydown", onEscape, true);
+    }
+    // Escape closes this dialog and not the Settings under it, wherever focus is.
+    function onEscape(event) {
+      if (event.key !== "Escape" || !open) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      close();
     }
 
-    async function show() {
+    // One of these dialogs, made like Lattice's Settings modal.
+    function present(kind, label, section, onClosed) {
+      section.dataset.gatewayPage = kind;
+      const closeButton = el("button", { type: "button", class: "ui-icon-button settings-close", "data-slot": "icon-button", "data-size": "compact", "data-tone": "neutral", "aria-label": zhUI ? "关闭" : "Close", html: svg('<path d="M18 6 6 18"></path><path d="m6 6 12 12"></path>', 16), onclick: close });
+      const backdrop = el("div", { class: "modal-backdrop", "data-lattice-gateway": `${kind}-backdrop`, "data-gateway-dialog-backdrop": true, onclick: close });
+      const dialog = el("div", { class: "modal-dialog-content", "data-lattice-gateway": kind, "data-gateway-dialog": true, role: "dialog", "aria-modal": "true", "aria-label": label, tabindex: "-1" },
+        el("div", { class: "settings-modal" }, closeButton, el("div", { class: "settings-content" }, section)));
+      document.body.append(backdrop, dialog);
+      open = [backdrop, dialog];
+      closed = onClosed || null;
+      liftAboveCover();
+      dialog.focus({ preventScroll: true });
+      addEventListener("keydown", onEscape, true);
+    }
+
+    async function show(inSettings = false) {
       if (open) return;
       if (!style.isConnected) document.head.append(style);
       const T = {
@@ -958,7 +1006,6 @@
         })
         : [row(T.noDevices, "")];
 
-      const closeButton = el("button", { type: "button", class: "ui-icon-button settings-close", "data-slot": "icon-button", "data-size": "compact", "data-tone": "neutral", "aria-label": T.close, html: svg('<path d="M18 6 6 18"></path><path d="m6 6 12 12"></path>', 16), onclick: close });
       const section = el("div", { class: "settings-section" },
         el("div", { class: "ui-settings-section-header" }, el("div", { class: "ui-settings-section-header-copy" },
           el("h2", { class: "ui-settings-section-header-title" }, T.title),
@@ -973,15 +1020,245 @@
           await api("/__gateway/api/logout", {}).catch(() => {});
           location.replace("/__gateway/login");
         }))) : null);
-      const backdrop = el("div", { class: "modal-backdrop", "data-lattice-gateway": "phone-backdrop", onclick: close });
-      const dialog = el("div", { class: "modal-dialog-content", "data-lattice-gateway": "phone", role: "dialog", "aria-modal": "true", "aria-label": T.title, tabindex: "-1" },
-        el("div", { class: "settings-modal" }, closeButton, el("div", { class: "settings-content" }, section)));
-      document.body.append(backdrop, dialog);
-      open = [backdrop, dialog];
-      liftAboveCover();
-      dialog.focus({ preventScroll: true });
-      dialog.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.stopPropagation(); close(); } });
+      if (inSettings) mount("phone", T.title, section);
+      else present("phone", T.title, section);
     }
+
+    // Gateway pages shown in Settings' own content pane, like Lattice's pages:
+    // the item in the sidebar is selected, Lattice's page is set aside, and on
+    // a narrow screen the page replaces the list, with Lattice's back button.
+    // Opened from elsewhere (the plugin's command, a hint), a page gets its
+    // own dialog instead.
+    let page = null;
+    function markNav() {
+      for (const item of document.querySelectorAll(".settings-nav [data-gateway-page-item]")) {
+        const on = page?.kind === item.dataset.gatewayPageItem;
+        item.classList.toggle("active", on);
+        if (on) item.setAttribute("aria-current", "page"); else item.removeAttribute("aria-current");
+      }
+    }
+    function leavePage(back = false) {
+      if (!page) return;
+      const { section, modal, cleanup } = page;
+      page = null;
+      section.remove();
+      delete modal.dataset.gatewayPage;
+      if (back) modal.querySelector(".settings-body")?.setAttribute("data-narrow-view", "root");
+      cleanup?.();
+      markNav();
+    }
+    function mount(kind, label, section, cleanup) {
+      if (!style.isConnected) document.head.append(style);
+      section.dataset.gatewayPage = kind;
+      const modal = document.querySelector(".settings-modal:has(> .settings-body)");
+      const content = modal?.querySelector('.settings-content [data-slot="scroll-area-content"]');
+      if (!content) {
+        present(kind, label, section, cleanup);
+        return;
+      }
+      leavePage();
+      content.append(section);
+      modal.dataset.gatewayPage = kind;
+      modal.querySelector(".settings-body")?.setAttribute("data-narrow-view", "page");
+      const viewport = modal.querySelector('.settings-content [data-slot="scroll-area-viewport"]');
+      if (viewport) viewport.scrollTop = 0;
+      page = { kind, section, modal, cleanup };
+      markNav();
+    }
+    // Any of Lattice's own items, or a search result, brings its page back.
+    document.addEventListener("click", (event) => {
+      const target = page && event.target.closest?.("button");
+      if (!target || !page.modal.contains(target)) return;
+      if (target.matches(".settings-back")) leavePage(true);
+      else if (target.closest(".settings-nav") && !target.dataset.gatewayPageItem) leavePage();
+    }, true);
+    // On a narrow screen Escape goes back to the list, as from Lattice's pages.
+    addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !page || open) return;
+      const nav = page.modal.querySelector(".settings-nav");
+      if (!nav || getComputedStyle(nav).display !== "none") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      leavePage(true);
+    }, true);
+
+    // "Version": what this host runs, the update on offer, what it brings,
+    // and Check now. Its words and controls are those of Lattice's own App
+    // updates (Settings › Editor & builds), whose Linux row it stands in for.
+    const V = zhUI ? {
+      nav: "版本",
+      phoneNav: "手机与应用",
+      title: "版本",
+      releases: "GitHub 发布页",
+      updatesGroup: "更新",
+      lattice: "Lattice",
+      latticeDetail: "版本由 Lattice-web-ui 固定，随它一起更新。",
+      ready: (v) => `新版本 ${v} 可安装`,
+      brings: (l) => `，包含 Lattice ${l}`,
+      takes: "更新约需一分钟，期间工作区会重新连接。",
+      update: (v) => `更新到 ${v}`,
+      upToDate: "已是最新",
+      checked: (when) => `${when}检查过`,
+      never: "还没有检查过",
+      running: (v) => `正在更新到 ${v}…`,
+      runningDetail: "进度显示在右下角的通知里，完成后页面会自动刷新。",
+      check: "检查更新",
+      checking: "正在检查…",
+      failed: (why) => `检查更新失败：${why}`,
+      timedOut: "主机没有回应，请稍后再试",
+      noUpdates: "这台主机不是从发布包安装的，不能在浏览器里更新。",
+      whatsNew: (v) => `${v} 的新功能`,
+      notes: (v) => `打开 ${v} 的发布说明`,
+      available: "有可用更新",
+    } : {
+      nav: "Version",
+      phoneNav: "Phone and app",
+      title: "Version",
+      releases: "GitHub Releases",
+      updatesGroup: "App updates",
+      lattice: "Lattice",
+      latticeDetail: "Pinned by Lattice-web-ui, and updated with it.",
+      ready: (v) => `Version ${v} is ready to install`,
+      brings: (l) => `, with Lattice ${l}`,
+      takes: "Updating takes about a minute; the workspace reconnects.",
+      update: (v) => `Update to ${v}`,
+      upToDate: "Up to date",
+      checked: (when) => `checked ${when}`,
+      never: "Not checked yet",
+      running: (v) => `Updating to ${v}…`,
+      runningDetail: "The notification in the corner shows how it goes. The page reloads when it is done.",
+      check: "Check for updates",
+      checking: "Checking…",
+      failed: (why) => `Couldn’t check for updates: ${why}`,
+      timedOut: "the host did not answer. Try again later",
+      noUpdates: "This host was not installed from a release kit, so it cannot update from the browser.",
+      whatsNew: (v) => `What’s new in ${v}`,
+      notes: (v) => `Open the release notes for ${v}`,
+      available: "Updates available",
+    };
+    const RELEASES = "https://github.com/lattice-writer/lattice-web-ui/releases";
+    const EXTERNAL = '<path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>';
+    const REFRESH = '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path>';
+    const ago = (seconds) => {
+      const format = new Intl.RelativeTimeFormat(zhUI ? "zh-CN" : "en", { numeric: "auto" });
+      const delta = Math.round(seconds - Date.now() / 1000);
+      for (const [unit, size] of [["day", 86400], ["hour", 3600], ["minute", 60]]) {
+        if (Math.abs(delta) >= size) return format.format(Math.round(delta / size), unit);
+      }
+      return format.format(0, "minute");
+    };
+    const day = (iso) => {
+      const date = new Date(iso);
+      return Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString(zhUI ? "zh-CN" : "en", { year: "numeric", month: "short", day: "numeric" });
+    };
+    const external = (href, label) => el("a", { class: "ui-icon-button", "data-slot": "icon-button", "data-size": "compact", "data-tone": "neutral", href, target: "_blank", rel: "noopener noreferrer", "aria-label": label, title: label, html: svg(EXTERNAL, 14) });
+    const reloadButton = (busy) => {
+      const node = el("button", { type: "button", class: "ui-button ui-button--secondary ui-button--compact ui-reload-button", "data-slot": "button", "data-size": "compact", "data-variant": "secondary", "aria-busy": busy ? "true" : null, onclick: () => checkNow() },
+        el("span", { class: `ui-reload-icon${busy ? " spin" : ""}`, "aria-hidden": "true", html: svg(REFRESH, 14) }), busy ? V.checking : V.check);
+      node.disabled = busy;
+      return node;
+    };
+
+    // Check now, shared by the Version page and the row in Editor & builds.
+    const checker = { busy: false, error: "" };
+    const redraw = () => { for (const listener of updateApi.listeners) listener(updateApi.state || {}); };
+    async function checkNow() {
+      if (checker.busy) return;
+      checker.busy = true;
+      checker.error = "";
+      redraw();
+      try {
+        let next = await api("/__gateway/api/update/check", {});
+        const end = Date.now() + 90_000;
+        while (next.checking && Date.now() < end) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          next = await api("/__gateway/api/update");
+        }
+        if (next.checking) checker.error = V.timedOut;
+        else if (next.checkFailed) checker.error = next.checkFailed.error || "";
+        checker.busy = false;
+        updateApi.apply(next);
+      } catch (error) {
+        checker.error = error.message;
+        checker.busy = false;
+        redraw();
+      }
+    }
+
+    // The Lattice-web-ui row: its version, where updates stand, and the one
+    // thing to do about it, as Lattice's own Version row says it.
+    function versionRow(state, label, prefix = "") {
+      const current = `${prefix}${state.current || ""}`;
+      const lattice = state.lattice || {};
+      if (state.updates === false) return row(label, `${current} · ${V.noUpdates}`);
+      if (state.running) {
+        const target = state.status?.target || state.latest;
+        return row(label, `${current} · ${V.running(target)} ${V.runningDetail}`);
+      }
+      if (state.available && !checker.busy) {
+        const brings = lattice.latest && lattice.latest !== lattice.current ? V.brings(lattice.latest) : "";
+        const update = el("button", { type: "button", class: "ui-button ui-button--tinted ui-button--compact", "data-slot": "button", "data-size": "compact", "data-variant": "tinted",
+          onclick: () => updateApi.start(state.latest) }, V.update(state.latest));
+        return row(label, `${current} · ${V.ready(state.latest)}${brings}${zhUI ? "。" : ". "}${V.takes}`, update);
+      }
+      const status = checker.busy ? V.checking
+        : checker.error ? V.failed(checker.error)
+          : state.checkedAt ? `${V.upToDate} · ${V.checked(ago(state.checkedAt))}` : V.never;
+      return row(label, `${current} · ${status}`, reloadButton(checker.busy));
+    }
+
+    async function showVersion() {
+      const section = el("div", { class: "settings-section" });
+      function render(state) {
+        const lattice = state.lattice || {};
+        const releases = state.available && !state.running ? (state.releases || []) : [];
+        const releaseRows = releases.map((release) => {
+          const date = day(release.publishedAt);
+          const changes = (release.changes || []).map((change) => change.replace(/\s*\(#\d+\)$/, ""));
+          return el("div", { class: "ui-row ui-row--data ui-settings-row", "data-slot": "settings-row" },
+            el("div", { class: "ui-settings-row-copy" },
+              el("span", { class: "ui-settings-row-label" }, release.version, date ? el("span", { class: "version-date" }, date) : null),
+              changes.length ? el("ul", { class: "version-changes" }, changes.map((change) => el("li", {}, change))) : null),
+            release.url ? el("div", { class: "ui-settings-row-control" }, external(release.url, V.notes(release.version))) : null);
+        });
+        section.replaceChildren(
+          el("div", { class: "ui-settings-section-header", "data-slot": "settings-section-header" },
+            el("div", { class: "ui-settings-section-header-copy" }, el("h2", { class: "ui-settings-section-header-title" }, V.title)),
+            el("div", { class: "ui-settings-section-header-actions" },
+              el("a", { class: "ui-button ui-button--ghost ui-button--compact", "data-slot": "button", "data-size": "compact", "data-variant": "ghost", href: RELEASES, target: "_blank", rel: "noopener noreferrer" },
+                V.releases, el("span", { class: "version-external", html: svg(EXTERNAL, 12) })))),
+          group(V.updatesGroup,
+            versionRow(state, "Lattice-web-ui"),
+            lattice.current ? row(V.lattice, `${lattice.current} · ${V.latticeDetail}`) : null),
+          ...(releaseRows.length ? [group(V.whatsNew(state.latest), ...releaseRows)] : []));
+      }
+      const listener = (state) => render(state);
+      render(updateApi.state || {});
+      updateApi.listeners.add(listener);
+      mount("version", V.title, section, () => updateApi.listeners.delete(listener));
+      api("/__gateway/api/update").then((state) => updateApi.apply(state)).catch(() => {});
+    }
+
+    // Lattice's own App updates row says Lattice on Linux doesn't update
+    // itself; here Lattice-web-ui does, so its row takes that one's place.
+    let editorRow = null;
+    function placeEditorRow() {
+      const theirs = document.querySelector('.settings-section:not([data-gateway-page]) [data-setting="version"]:not([data-lattice-gateway])');
+      if (!theirs || !theirs.querySelector(".ui-button--ghost")) return;
+      if (!theirs.hasAttribute("data-gateway-replaced")) theirs.setAttribute("data-gateway-replaced", "");
+      if (editorRow?.isConnected && editorRow.previousElementSibling === theirs) return;
+      editorRow?.remove();
+      editorRow = versionRow(updateApi.state || {}, V.nav, "Lattice-web-ui ");
+      editorRow.dataset.latticeGateway = "version-row";
+      theirs.after(editorRow);
+    }
+    updateApi.listeners.add(() => {
+      if (!editorRow?.isConnected) return;
+      const next = versionRow(updateApi.state || {}, V.nav, "Lattice-web-ui ");
+      next.dataset.latticeGateway = "version-row";
+      editorRow.replaceWith(next);
+      editorRow = next;
+    });
 
     // Lattice covers the page and makes the rest inert when this tab loses
     // the workspace or its connection. The dialog needs neither, so it stays
@@ -1004,25 +1281,36 @@
       navStyle.dataset.latticeGateway = "settings-style";
       navStyle.textContent = `
         .settings-nav:has(.settings-search-results) [data-lattice-gateway="settings-group"] { display: none; }
+        [data-setting="version"][data-gateway-replaced] { display: none; }
       `;
       document.head.append(navStyle);
-      const icon = (paths, size, cls, width = 2) => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" class="${cls}" aria-hidden="true">${paths}</svg>`;
+      // Lucide at Lattice's own icons' weight (1.6 at 15px, like its Phosphor set).
+      const icon = (paths, size, cls, width = 1.6) => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" class="${cls}" aria-hidden="true">${paths}</svg>`;
+      const item = (kind, label, paths, open, badge = false) => el("button", { type: "button", "data-lattice-gateway": kind === "phone" ? "settings-item" : "settings-version", "data-gateway-page-item": kind, onclick: open,
+        html: icon(paths, 15, "animated-product-icon")
+          + `<span title="${label}">${label}</span>`
+          + (badge ? `<span class="settings-nav-badge" role="img" aria-label="${V.available}" hidden></span>` : "")
+          + icon('<path d="m9 18 6-6-6-6"></path>', 14, "settings-nav-chevron") });
       const place = () => {
+        if (page && !page.section.isConnected) { const { cleanup } = page; page = null; cleanup?.(); }
+        placeEditorRow();
         const nav = document.querySelector(".settings-modal .settings-nav");
         if (!nav) return;
-        let item = nav.querySelector('[data-lattice-gateway="settings-group"]');
-        if (!item) {
-          item = el("div", { class: "settings-nav-group", role: "group", "aria-label": "Lattice-web-ui", "data-lattice-gateway": "settings-group" },
+        let group = nav.querySelector('[data-lattice-gateway="settings-group"]');
+        if (!group) {
+          group = el("div", { class: "settings-nav-group", role: "group", "aria-label": "Lattice-web-ui", "data-lattice-gateway": "settings-group" },
             el("div", { class: "settings-nav-group-label" }, "Lattice-web-ui"),
-            el("button", { type: "button", "data-lattice-gateway": "settings-item", onclick: () => show(),
-              html: icon('<rect width="14" height="20" x="5" y="2" rx="2" ry="2"></rect><path d="M12 18h.01"></path>', 15, "animated-product-icon")
-                + '<span title="Phone and app">Phone and app</span>'
-                + icon('<path d="m9 18 6-6-6-6"></path>', 14, "settings-nav-chevron", 1.6) }));
+            item("phone", V.phoneNav, '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"></rect><path d="M12 18h.01"></path>', () => show(true)),
+            item("version", V.nav, '<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"></path><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"></circle>', () => showVersion(), true));
+          markNav();
         }
+        const badge = group.querySelector(".settings-nav-badge");
+        if (badge && badge.hidden === Boolean(updateApi.state?.available)) badge.hidden = !updateApi.state?.available;
         // After Lattice's own groups, which it may redraw after a search.
-        if (nav.lastElementChild !== item) nav.append(item);
+        if (nav.lastElementChild !== group) nav.append(group);
       };
       new MutationObserver(place).observe(document.body, { childList: true, subtree: true });
+      updateApi.listeners.add(place);
       place();
     }
 
