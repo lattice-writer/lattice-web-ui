@@ -1,7 +1,7 @@
 schema = 1
 id = "io.github.knightnemo.lattice-remote"
 name = "Lattice-web-ui"
-version = "0.9.8"
+version = "0.9.9"
 api = 1
 license = "MIT"
 description = "Open the Lattice running on your Linux host in the browser, and pair your other devices with it."
