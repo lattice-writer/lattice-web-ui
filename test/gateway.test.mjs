@@ -70,7 +70,7 @@ before(async () => {
     "--state-dir", join(dir, "state"), "--token-file", join(dir, "access-token"), "--insecure-dev-cookies",
     "--rewrite-loopback-page", "--open-requests", join(dir, "open-requests"), "--projects-root", join(dir, "projects"),
     "--update-dir", join(dir, "update"),
-  ], { stdio: ["ignore", "inherit", "inherit"] });
+  ], { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, HOME: dir } });
   await waitFor(`${base}/__gateway/health`);
   token = readFileSync(join(dir, "access-token"), "utf8").trim();
 });
@@ -250,6 +250,45 @@ test("only the owner sees the update on offer and starts it", { skip }, async ()
   assert.equal(statSync(join(update, "request")).mode & 0o777, 0o600);
   assert.equal((await get()).running, true);
   assert.equal((await post("/__gateway/api/update/start", { version: "99.0.0" }, owner)).status, 409, "one run at a time");
+});
+
+test("Open panels browse the home folder, make folders and take uploads, signed in only", { skip }, async () => {
+  const owner = cookieOf(await post("/__gateway/api/login", { token }));
+  writeFileSync(join(dir, "projects/refs.bib"), "@book{x}");
+  writeFileSync(join(dir, "projects/notes.txt"), "x");
+  assert.equal((await post("/__gateway/api/files", { start: true })).status, 401);
+  assert.equal((await post("/__gateway/api/files", { start: true }, owner, "https://evil.example")).status, 403);
+
+  // It starts in the projects folder, lists folders then the files asked for.
+  const start = await (await post("/__gateway/api/files", { start: true, files: true, extensions: ["bib"] }, owner)).json();
+  assert.equal(start.path, join(dir, "projects"));
+  assert.deepEqual(start.entries.map((e) => `${e.kind}:${e.name}`), ["folder:paper", "file:refs.bib"]);
+  assert.equal(start.entries[0].project, true);
+  assert.equal((await post("/__gateway/api/files", { path: "/etc" }, owner)).status, 400, "nothing outside home");
+  assert.equal((await post("/__gateway/api/files", { path: join(dir, "projects/../..") }, owner)).status, 400);
+
+  const made = await post("/__gateway/api/files/folder", { path: join(dir, "projects"), name: "thesis" }, owner);
+  assert.equal(made.status, 200);
+  assert.equal((await made.json()).path, join(dir, "projects/thesis"));
+  assert.equal((await post("/__gateway/api/files/folder", { path: join(dir, "projects"), name: "../x" }, owner)).status, 400);
+
+  // An upload lands in the folder shown, under a free name.
+  const upload = (name, body, folder = join(dir, "projects"), from = origin, cookie = owner) => fetch(`${base}/__gateway/api/upload`, {
+    method: "POST", body,
+    headers: { Origin: from, Cookie: cookie, "X-Upload-Folder": encodeURIComponent(folder), "X-Upload-Name": encodeURIComponent(name) },
+  });
+  const sent = await upload("refs.bib", "@book{y}");
+  assert.equal(sent.status, 200);
+  const { path } = await sent.json();
+  assert.equal(path, join(dir, "projects/refs (2).bib"));
+  assert.equal(readFileSync(path, "utf8"), "@book{y}");
+  assert.equal((await upload("论文.zip", "PK")).status, 200);
+  assert.ok(existsSync(join(dir, "projects/论文.zip")));
+  assert.equal((await upload("x.zip", "PK", "/tmp")).status, 400, "only inside home");
+  assert.equal((await upload("../x.zip", "PK")).status, 400);
+  assert.equal((await upload("x.zip", "PK", join(dir, "projects"), "https://evil.example")).status, 403);
+  assert.equal((await upload("x.zip", "PK", join(dir, "projects"), origin, "")).status, 401);
+  assert.ok(!existsSync(join(dir, "projects/x.zip")));
 });
 
 test("Check now: only the owner asks lattice-host to look again", { skip }, async () => {

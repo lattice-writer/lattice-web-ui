@@ -97,6 +97,8 @@ pub struct App {
     encoder: crate::compress::Encoder,
     /// Files tabs save, handed to the device as downloads.
     downloads: crate::downloads::Downloads,
+    /// The folder a tab's Open panel browses: the home folder the gateway runs in.
+    home: Option<std::path::PathBuf>,
 }
 
 /// The Lattice workspaces browser tabs hold through the gateway.
@@ -327,6 +329,9 @@ impl App {
             phone_hint: args.state_dir.join("phone-hint-answered"),
             encoder: Default::default(),
             downloads: crate::downloads::Downloads::new(args.state_dir.join("downloads")),
+            home: std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|h| h.is_absolute()),
             tex: args.tlmgr.clone().map(|tlmgr| crate::tex::Tex {
                 tlmgr,
                 dry_run: args.tlmgr_dry_run,
@@ -925,6 +930,106 @@ fn valid_session_token(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// A file a tab uploads from its device, written into the folder its Open
+/// panel shows (headers `x-upload-folder` and `x-upload-name`, both
+/// %-encoded), under a free name. Answers its path on the host.
+async fn upload(app: &App, req: Request<Incoming>) -> Response<Body> {
+    use tokio::io::AsyncWriteExt;
+    let Some(home) = app.home.as_deref() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "no_home",
+            "The gateway does not know its home folder.",
+        );
+    };
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::files::percent_decode)
+    };
+    let (Some(folder), Some(name)) = (header("x-upload-folder"), header("x-upload-name")) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "bad_upload",
+            "The upload names no folder or file.",
+        );
+    };
+    let too_large = || {
+        error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            "Files larger than 1 GB cannot be uploaded here.",
+        )
+    };
+    if req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|n| n > crate::files::MAX_UPLOAD)
+    {
+        return too_large();
+    }
+    let target = match crate::files::upload_path(home, Path::new(&folder), &name) {
+        Ok(target) => target,
+        Err(message) => return error(StatusCode::BAD_REQUEST, "upload_refused", &message),
+    };
+    let part = target.with_file_name(format!(".lattice-upload-{}.part", store::random_hex(6)));
+    let failed = |e: String| {
+        let _ = fs::remove_file(&part);
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upload_failed",
+            &format!("The upload failed: {e}"),
+        )
+    };
+    let mut file = match tokio::fs::File::create(&part).await {
+        Ok(file) => file,
+        Err(e) => return failed(e.to_string()),
+    };
+    let mut body = req.into_body();
+    let mut total: u64 = 0;
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => return failed(e.to_string()),
+        };
+        if let Ok(data) = frame.into_data() {
+            total += data.len() as u64;
+            if total > crate::files::MAX_UPLOAD {
+                let _ = fs::remove_file(&part);
+                return too_large();
+            }
+            if let Err(e) = file.write_all(&data).await {
+                return failed(e.to_string());
+            }
+        }
+    }
+    if let Err(e) = file.flush().await {
+        return failed(e.to_string());
+    }
+    drop(file);
+    // Never over a file that appeared meanwhile: a hard link fails if the name is taken.
+    let mut target = target;
+    for _ in 0..3 {
+        match fs::hard_link(&part, &target) {
+            Ok(()) => {
+                let _ = fs::remove_file(&part);
+                return json_response(StatusCode::OK, json!({ "path": target.to_string_lossy() }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                match crate::files::upload_path(home, Path::new(&folder), &name) {
+                    Ok(next) => target = next,
+                    Err(message) => return failed(message),
+                }
+            }
+            Err(e) => return failed(e.to_string()),
+        }
+    }
+    failed("no free name".into())
+}
+
 fn list_projects(root: Option<&Path>) -> Vec<Value> {
     let Some(root) = root else { return Vec::new() };
     let Ok(entries) = fs::read_dir(root) else {
@@ -1185,6 +1290,53 @@ async fn api(
                     &message,
                 ),
             }
+        }
+        "/__gateway/api/files" | "/__gateway/api/files/folder"
+            if entrance == Entrance::Public && principal.is_some() =>
+        {
+            let Some(home) = app.home.as_deref() else {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "no_home",
+                    "The gateway does not know its home folder.",
+                );
+            };
+            let body = match read_json(req).await {
+                Ok(v) => v,
+                Err(r) => return *r,
+            };
+            let asked = body.get("path").and_then(Value::as_str);
+            let result = if path.ends_with("/folder") {
+                let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+                crate::files::make_folder(home, Path::new(asked.unwrap_or("")), name)
+                    .map(|made| json!({ "path": made.to_string_lossy() }))
+            } else {
+                let folder = if body.get("start").and_then(Value::as_bool) == Some(true) {
+                    crate::files::start(home, asked, app.projects_root.as_deref())
+                } else {
+                    Ok(Path::new(asked.unwrap_or("")).to_path_buf())
+                };
+                let extensions: Vec<String> = body
+                    .get("extensions")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .take(64)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let files = body.get("files").and_then(Value::as_bool) == Some(true);
+                folder.and_then(|f| crate::files::list(home, &f, files, &extensions))
+            };
+            match result {
+                Ok(value) => json_response(StatusCode::OK, value),
+                Err(message) => error(StatusCode::BAD_REQUEST, "files_refused", &message),
+            }
+        }
+        "/__gateway/api/upload" if entrance == Entrance::Public && principal.is_some() => {
+            upload(&app, req).await
         }
         "/__gateway/api/phone/hint" if owner => match fs::write(&app.phone_hint, b"") {
             Ok(()) => json_response(StatusCode::OK, json!({ "hintDismissed": true })),
