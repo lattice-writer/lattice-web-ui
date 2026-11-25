@@ -21,6 +21,7 @@ mod proxy;
 mod store;
 mod tex;
 mod update;
+mod wsdeflate;
 
 use clap::Parser;
 use std::net::SocketAddr;

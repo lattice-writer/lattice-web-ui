@@ -3,7 +3,9 @@
 //! The browser host expects to be reached at its own loopback origin, so the
 //! request's Host, Origin and Referer are rewritten to it, and redirects that
 //! name it are rewritten back to the public origin. WebSocket upgrades are
-//! tunneled byte for byte and end when the device that opened them is revoked.
+//! tunneled byte for byte, or with permessage-deflate on the browser's leg
+//! when the browser offers it (see `wsdeflate.rs`), and end when the device
+//! that opened them is revoked.
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty};
@@ -342,7 +344,7 @@ pub async fn forward(
 }
 
 async fn tunnel(
-    outbound: Request<Empty<Bytes>>,
+    mut outbound: Request<Empty<Bytes>>,
     client_upgrade: hyper::upgrade::OnUpgrade,
     upstream: &Upstream,
     public_origin: &str,
@@ -350,6 +352,13 @@ async fn tunnel(
     mut revocations: broadcast::Receiver<String>,
     hold: Option<Box<dyn std::any::Any + Send>>,
 ) -> Response<Body> {
+    // The gateway compresses the browser's leg itself, so Lattice is not asked to.
+    let deflate = crate::wsdeflate::negotiate(outbound.headers());
+    if deflate.is_some() {
+        outbound
+            .headers_mut()
+            .remove(header::SEC_WEBSOCKET_EXTENSIONS);
+    }
     let Ok(stream) = TcpStream::connect(upstream.addr).await else {
         return bad_gateway();
     };
@@ -380,6 +389,14 @@ async fn tunnel(
         };
         let mut client = TokioIo::new(client);
         let mut server = TokioIo::new(server);
+        let relay = async {
+            match deflate {
+                Some(agreed) => crate::wsdeflate::relay(&mut client, &mut server, agreed).await,
+                None => {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            }
+        };
         let revoked = async {
             loop {
                 match revocations.recv().await {
@@ -390,13 +407,19 @@ async fn tunnel(
             }
         };
         tokio::select! {
-            _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+            _ = relay => {}
             _ = revoked => {}
         }
     });
     // A 101 keeps its Upgrade and Connection headers: the client needs them.
     let (mut parts, _) = response.into_parts();
     prepare_response_headers(&mut parts.headers, upstream, public_origin);
+    // Lattice was offered no extension; what the browser gets is the gateway's.
+    if let Some(agreed) = deflate {
+        parts
+            .headers
+            .insert(header::SEC_WEBSOCKET_EXTENSIONS, agreed.response());
+    }
     Response::from_parts(parts, empty())
 }
 
