@@ -2,7 +2,7 @@
 // Build first: cargo build --manifest-path gateway/Cargo.toml
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -289,6 +289,74 @@ test("Open panels browse the home folder, make folders and take uploads, signed 
   assert.equal((await upload("x.zip", "PK", join(dir, "projects"), "https://evil.example")).status, 403);
   assert.equal((await upload("x.zip", "PK", join(dir, "projects"), origin, "")).status, 401);
   assert.ok(!existsSync(join(dir, "projects/x.zip")));
+});
+
+test("the compiled PDF: signed in only, inside home only, and a 304 for the copy the tab holds", { skip }, async () => {
+  const owner = cookieOf(await post("/__gateway/api/login", { token }));
+  const project = join(dir, "projects/compiled");
+  mkdirSync(join(project, ".research"), { recursive: true });
+  const manifest = { schemaVersion: 1, projectId: "c", name: "Compiled", rootDocuments: [{ path: "main.tex", name: "main", isDefault: true }], primaryBibliography: "", trusted: true };
+  writeFileSync(join(project, ".research/project.json"), JSON.stringify(manifest));
+  writeFileSync(join(project, "main.tex"), "\\documentclass{article}");
+  writeFileSync(join(project, "main.pdf"), "%PDF-1.7 compiled");
+  const pdf = (root, cookie = owner, headers = {}) => fetch(`${base}/__gateway/api/compiled-pdf?root=${encodeURIComponent(root)}`, {
+    headers: { ...(cookie ? { Cookie: cookie } : {}), ...headers },
+  });
+  const before = seen.length;
+
+  // Signed out: refused, and the file is not read.
+  const stranger = await pdf(project, "");
+  assert.equal(stranger.status, 401);
+  assert.doesNotMatch(await stranger.text(), /compiled/);
+  assert.equal((await pdf(project, "lattice_device=forged; lattice_owner=forged")).status, 401);
+  assert.equal((await pdf(project, owner, { Origin: "https://evil.example" })).status, 403);
+
+  // Signed in: the bytes, tagged; the same tag back is a 304 with no body.
+  const first = await pdf(project);
+  assert.equal(first.status, 200);
+  assert.equal(first.headers.get("content-type"), "application/pdf");
+  assert.equal(first.headers.get("cache-control"), "no-store");
+  assert.equal(first.headers.get("cross-origin-resource-policy"), "same-origin");
+  assert.equal(first.headers.get("content-encoding"), null, "a PDF is compressed already");
+  assert.equal(await first.text(), "%PDF-1.7 compiled");
+  const tag = first.headers.get("etag");
+  assert.match(tag, /^"sha256-[0-9a-f]{64}-17"$/);
+  const again = await pdf(project, owner, { "If-None-Match": `"sha256-old-1", ${tag}` });
+  assert.equal(again.status, 304);
+  assert.equal(again.headers.get("etag"), tag);
+  assert.equal(await again.text(), "");
+  writeFileSync(join(project, "main.pdf"), "%PDF-1.7 rebuilt!");
+  const rebuilt = await pdf(project, owner, { "If-None-Match": tag });
+  assert.equal(rebuilt.status, 200, "a changed file is sent again");
+  assert.equal(await rebuilt.text(), "%PDF-1.7 rebuilt!");
+
+  // Only projects inside the home folder; a PDF linked out of it is left to Lattice.
+  const outside = mkdtempSync(join(tmpdir(), "lattice-outside-"));
+  try {
+    mkdirSync(join(outside, ".research"));
+    writeFileSync(join(outside, ".research/project.json"), JSON.stringify(manifest));
+    writeFileSync(join(outside, "main.pdf"), "%PDF-1.7 not yours");
+    for (const root of [outside, "/etc", join(project, "../../.."), "projects/compiled", ""]) {
+      const refused = await pdf(root);
+      assert.equal(refused.status, 400, root);
+      assert.doesNotMatch(await refused.text(), /not yours/);
+    }
+    rmSync(join(project, "main.pdf"));
+    symlinkSync(join(outside, "main.pdf"), join(project, "main.pdf"));
+    const linked = await pdf(project);
+    assert.equal(linked.status, 409);
+    assert.doesNotMatch(await linked.text(), /not yours/);
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+  }
+
+  // A standalone figure may be the PDF on screen: the gateway cannot say.
+  rmSync(join(project, "main.pdf"));
+  assert.equal((await pdf(project)).status, 404, "no PDF: Lattice answers");
+  writeFileSync(join(project, "main.pdf"), "%PDF-1.7 compiled");
+  writeFileSync(join(project, "figure.tex"), "\\documentclass[tikz]{standalone}");
+  assert.equal((await pdf(project)).status, 409);
+  assert.equal(seen.length, before, "nothing reached Lattice");
 });
 
 test("Check now: only the owner asks lattice-host to look again", { skip }, async () => {

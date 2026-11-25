@@ -801,6 +801,16 @@ async fn route(app: Arc<App>, entrance: Entrance, req: Request<Incoming>) -> Res
             };
             return json_response(StatusCode::OK, state);
         }
+        (&Method::GET, "/__gateway/api/compiled-pdf") if entrance == Entrance::Public => {
+            if principal.is_none() {
+                return error(
+                    StatusCode::UNAUTHORIZED,
+                    "sign_in_required",
+                    "Pair this browser or sign in with the owner token.",
+                );
+            }
+            return compiled_pdf(&app, &req).await;
+        }
         (&Method::GET, "/__gateway/api/devices") => {
             if principal != Some(Principal::Owner) {
                 return error(
@@ -1101,6 +1111,100 @@ fn claim_open_request(dir: Option<&Path>, public_origin: &str) -> Option<String>
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
     .then(|| format!("/?entry={rest}"))
+}
+
+/// `GET /__gateway/api/compiled-pdf?root=<project folder>`: the PDF Lattice's
+/// `read_compiled_pdf` would send for that project (`crate::pdf`), tagged
+/// with its SHA-256 and size. A request naming that tag in `If-None-Match`
+/// gets a 304 and no bytes. 409 when the gateway cannot be sure which file
+/// Lattice reads, 404 when Lattice would find none: the tab then asks Lattice.
+async fn compiled_pdf(app: &App, req: &Request<Incoming>) -> Response<Body> {
+    // Only our own page reads it: a cross-site fetch carries an Origin.
+    if let Some(sent) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !sent.eq_ignore_ascii_case(&app.public_origin) {
+            return error(
+                StatusCode::FORBIDDEN,
+                "cross_origin",
+                "This request did not come from the gateway's own page.",
+            );
+        }
+    }
+    let Some(home) = app.home.clone() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "no_home",
+            "The gateway does not know its home folder.",
+        );
+    };
+    let query = req.uri().query().unwrap_or("").to_string();
+    let wanted = req
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    tokio::task::spawn_blocking(move || compiled_pdf_answer(&home, &query, wanted.as_deref()))
+        .await
+        .unwrap_or_else(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pdf_failed",
+                "The compiled PDF could not be read.",
+            )
+        })
+}
+
+/// [`compiled_pdf`]'s answer for the query `root=<folder>` and the tags the
+/// tab holds (`If-None-Match`).
+fn compiled_pdf_answer(home: &Path, query: &str, wanted: Option<&str>) -> Response<Body> {
+    let root = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("root="))
+        .and_then(crate::files::percent_decode)
+        .unwrap_or_default();
+    let compiled = match crate::pdf::read(home, &root) {
+        Ok(compiled) => compiled,
+        Err(crate::pdf::Miss::Refused(message)) => {
+            return error(StatusCode::BAD_REQUEST, "pdf_refused", message)
+        }
+        Err(crate::pdf::Miss::NoPdf(message)) => {
+            return error(StatusCode::NOT_FOUND, "no_pdf", message)
+        }
+        Err(crate::pdf::Miss::Unknown(message)) => {
+            return error(StatusCode::CONFLICT, "pdf_unknown", message)
+        }
+    };
+    let unchanged = wanted.is_some_and(|w| crate::pdf::names_tag(w, &compiled.tag));
+    let mut response = if unchanged {
+        let mut response = Response::new(empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response
+    } else {
+        let mut response = Response::new(full(compiled.bytes));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/pdf"),
+        );
+        response
+    };
+    let headers = response.headers_mut();
+    if let Ok(tag) = HeaderValue::from_str(&compiled.tag) {
+        headers.insert(header::ETAG, tag);
+    }
+    // The tab keeps its own copy; the browser's cache must not answer for it.
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        "cross-origin-resource-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 fn urlencode(value: &str) -> String {
@@ -1746,5 +1850,53 @@ mod tests {
     #[test]
     fn next_redirects_stay_on_this_site() {
         assert_eq!(urlencode("/a b?x=1"), "/a%20b%3Fx%3D1");
+    }
+
+    #[test]
+    fn the_compiled_pdf_answers_with_its_tag_and_a_304_when_the_tab_holds_it() {
+        let home = std::env::temp_dir().join(format!("lattice-pdf-{}", store::random_hex(6)));
+        let project = home.join("projects/my paper");
+        fs::create_dir_all(project.join(".research")).unwrap();
+        fs::write(
+            project.join(".research/project.json"),
+            r#"{"schemaVersion":1,"projectId":"p","name":"P","rootDocuments":[{"path":"main.tex","name":"main","isDefault":true}],"primaryBibliography":"","trusted":true}"#,
+        )
+        .unwrap();
+        fs::write(project.join("main.tex"), "\\documentclass{article}").unwrap();
+        let query = format!("root={}", urlencode(&project.to_string_lossy()));
+        let status = |wanted: Option<&str>| compiled_pdf_answer(&home, &query, wanted).status();
+        // No PDF yet: Lattice is asked, and answers as it does.
+        assert_eq!(status(None), StatusCode::NOT_FOUND);
+        fs::write(project.join("main.pdf"), "%PDF-1.7 one").unwrap();
+        let first = compiled_pdf_answer(&home, &query, None);
+        assert_eq!(first.status(), StatusCode::OK);
+        let headers = first.headers();
+        assert_eq!(headers[header::CONTENT_TYPE], "application/pdf");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers["cross-origin-resource-policy"], "same-origin");
+        let tag = headers[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(tag, crate::pdf::tag_of(b"%PDF-1.7 one"));
+        assert_eq!(hyper::body::Body::size_hint(first.body()).exact(), Some(12));
+        // The tab names what it holds: one small answer.
+        let again = compiled_pdf_answer(&home, &query, Some(&format!("\"old\", {tag}")));
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(again.headers()[header::ETAG], tag.as_str());
+        assert_eq!(hyper::body::Body::size_hint(again.body()).exact(), Some(0));
+        // A new build: the new bytes, whatever the tab holds.
+        fs::write(project.join("main.pdf"), "%PDF-1.7 two").unwrap();
+        assert_eq!(status(Some(&tag)), StatusCode::OK);
+        // A standalone figure may be the PDF on screen: unknown.
+        fs::write(project.join("fig.tex"), "\\documentclass{standalone}").unwrap();
+        assert_eq!(status(Some(&tag)), StatusCode::CONFLICT);
+        // Outside home, or no path at all: refused.
+        assert_eq!(
+            compiled_pdf_answer(&home, "root=%2Fetc", None).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            compiled_pdf_answer(&home, "", None).status(),
+            StatusCode::BAD_REQUEST
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 }
