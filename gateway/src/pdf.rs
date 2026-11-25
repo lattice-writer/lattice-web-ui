@@ -20,12 +20,15 @@
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 /// Lattice's manifest, relative to the project root.
 const MANIFEST: &str = ".research/project.json";
+/// Each root document a build here wrote a PDF of (`shown_pdf::HASHES`).
+const HASHES: &str = ".research/cache/build-pdf-hashes.json";
 /// Entries looked at for a document that compiles alone; past this the
 /// project is too big to be sure of quickly, and Lattice is asked instead.
 const MAX_WALK: usize = 20_000;
@@ -211,8 +214,24 @@ fn normal(relative: &Path) -> Vec<std::ffi::OsString> {
 /// build of anything else (`resolve_compile_root`, `choose_compile_root`).
 /// Symbolic links are not followed: Lattice refuses a document behind one.
 /// Git's own folder holds no document the editor opens.
+///
+/// Such a document deleted since its build is still the one Lattice reads,
+/// its PDF left beside where it was. Each build that writes a PDF records
+/// its document in `HASHES` (`shown_pdf::record_hash`), and only the next
+/// build forgets deleted ones, so one recorded there whose `.tex` is gone
+/// counts too.
 fn may_show_another(root: &Path, default: &str) -> Result<bool, Miss> {
     let default = normal(Path::new(default));
+    let recorded: BTreeMap<String, serde_json::Value> = fs::read(root.join(HASHES))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default();
+    if recorded
+        .keys()
+        .any(|document| normal(Path::new(document)) != default && !root.join(document).is_file())
+    {
+        return Ok(true);
+    }
     let mut folders = vec![root.to_path_buf()];
     let mut seen = 0usize;
     while let Some(folder) = folders.pop() {
@@ -506,6 +525,21 @@ mod tests {
         fs::remove_file(thesis.join("paper/ch1.tex")).unwrap();
         fs::write(thesis.join("paper/main.tex"), "\\documentclass{standalone}").unwrap();
         assert!(compiled_pdf_path(&home, &project(&home)).is_ok());
+        // One built and deleted since: Lattice still reads its PDF until the next build.
+        fs::create_dir_all(thesis.join(".research/cache")).unwrap();
+        let hashes = thesis.join(".research/cache/build-pdf-hashes.json");
+        fs::write(&hashes, r#"{"paper/main.tex":"aa","rebuttal.tex":"bb"}"#).unwrap();
+        assert!(compiled_pdf_path(&home, &project(&home)).is_ok());
+        fs::write(
+            &hashes,
+            r#"{"paper/main.tex":"aa","figures/gone.tex":"cc"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled_pdf_path(&home, &project(&home)),
+            Err(Miss::Unknown(_))
+        ));
+        fs::remove_file(&hashes).unwrap();
         // One behind a symbolic link cannot be opened as a root.
         let figures =
             std::env::temp_dir().join(format!("lw-pdf-fig-{}", crate::store::random_hex(6)));
