@@ -252,6 +252,28 @@ test("only the owner sees the update on offer and starts it", { skip }, async ()
   assert.equal((await post("/__gateway/api/update/start", { version: "99.0.0" }, owner)).status, 409, "one run at a time");
 });
 
+test("Check now: only the owner asks lattice-host to look again", { skip }, async () => {
+  const update = join(dir, "update");
+  const owner = cookieOf(await post("/__gateway/api/login", { token }));
+  const invite = await (await post("/__gateway/api/invites", {}, owner)).json();
+  const device = cookieOf(await post("/__gateway/api/redeem", { code: invite.url.split("#")[1], label: "Check phone" }));
+  rmSync(join(update, "check"), { force: true });
+  assert.notEqual((await post("/__gateway/api/update/check", {}, device)).status, 202);
+  assert.equal((await post("/__gateway/api/update/check", {}, owner, "https://evil.example")).status, 403);
+  assert.equal(existsSync(join(update, "check")), false);
+
+  writeFileSync(join(update, "available.json"), JSON.stringify({ latest: "99.0.0", checkedAt: 1, releases: [{ version: "99.0.0", changes: ["A version page"] }, { version: "0.0.1" }] }));
+  writeFileSync(join(update, "check-failed.json"), JSON.stringify({ error: "offline", at: 2 }));
+  const asked = await post("/__gateway/api/update/check", {}, owner);
+  assert.equal(asked.status, 202);
+  const state = await asked.json();
+  assert.equal(state.checking, true);
+  assert.equal(state.checkFailed, null, "a new request clears the last failure");
+  assert.deepEqual(state.releases.map((r) => r.version), ["99.0.0"], "only versions newer than this gateway");
+  assert.equal(statSync(join(update, "check")).mode & 0o777, 0o600);
+  rmSync(join(update, "check"));
+});
+
 test("Phone and app: the owner's address code, the one-time hint, and the devices address", { skip }, async () => {
   assert.equal((await fetch(`${base}/__gateway/api/phone`)).status, 401);
   const owner = cookieOf(await post("/__gateway/api/login", { token }));

@@ -38,10 +38,11 @@ UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "s
 UNITS = ("lattice-display.service", "lattice-browser-host.service", "lattice-gateway.service")
 LATTICE_PORT = 18452  # Fixed by Lattice: src-tauri/src/browser_host.rs PREFERRED_PORT.
 KEEP_RELEASES = 3
-# The owner's update prompt: a timer looks for a newer stable kit, and a path
-# unit runs the update when the owner selects Update in the browser.
-UPDATE_UNITS = ("lattice-update-check.timer", "lattice-update.path")
-UPDATE_FILES = ("lattice-update-check.service", "lattice-update-check.timer", "lattice-update.path", "lattice-update.service")
+# The owner's update prompt: a timer looks for a newer stable kit, a path unit
+# looks again when the owner selects Check now in the browser, and another
+# runs the update when the owner selects Update.
+UPDATE_UNITS = ("lattice-update-check.timer", "lattice-update-check.path", "lattice-update.path")
+UPDATE_FILES = ("lattice-update-check.service", "lattice-update-check.timer", "lattice-update-check.path", "lattice-update.path", "lattice-update.service")
 UPDATE_REPO = "lattice-writer/lattice-web-ui"
 KEEP_KITS = 2
 VERSION_RE = re.compile(r"\d{1,6}\.\d{1,6}\.\d{1,6}")
@@ -358,6 +359,16 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
+""",
+            "lattice-update-check.path": f"""[Unit]
+Description=Look for a newer lattice-web-ui release when the owner asks from the browser
+
+[Path]
+PathExists={update_dir(root) / 'check'}
+Unit=lattice-update-check.service
+
+[Install]
+WantedBy=default.target
 """,
             "lattice-update.path": f"""[Unit]
 Description=Update lattice-web-ui when the owner asks from the browser
@@ -742,14 +753,51 @@ def cmd_phone(args: argparse.Namespace) -> None:
     show_phone(args.root, read_config(args.root))
 
 
+CHANGE_RE = re.compile(r"^[-*] (.+?)(?: \([0-9a-f]{7,40}\))?$")
+
+
+def release_notes(release: dict) -> dict | None:
+    """A stable release as the owner's Version page lists it: its version,
+    date, page, and the changes its notes list (release PRs left out)."""
+    tag = str(release.get("tag_name", ""))
+    if release.get("draft") or release.get("prerelease") or not (tag.startswith("v") and VERSION_RE.fullmatch(tag[1:])):
+        return None
+    changes = []
+    for line in str(release.get("body") or "").splitlines():
+        match = CHANGE_RE.match(line.strip())
+        if match and not re.match(r"Release \d", match.group(1)):
+            changes.append(match.group(1)[:300])
+    url = str(release.get("html_url") or "")
+    return {
+        "version": tag[1:],
+        "publishedAt": str(release.get("published_at") or ""),
+        "url": url if url.startswith("https://github.com/") else "",
+        "changes": changes[:12],
+    }
+
+
 def cmd_check_update(args: argparse.Namespace) -> None:
     """Look for a newer stable kit; the gateway shows the owner what is found."""
     root: Path = args.root
+    folder = update_dir(root)
+    # The owner's Check now: this run answers it.
+    (folder / "check").unlink(missing_ok=True)
+    try:
+        check_update(root, folder)
+    except (HostError, OSError, ValueError) as error:
+        reason = str(error) if isinstance(error, HostError) else f"could not read the latest release from GitHub ({error})."
+        write_private_json(folder / "check-failed.json", {"error": reason[:300], "at": int(time.time())})
+        raise HostError(reason) from error
+    (folder / "check-failed.json").unlink(missing_ok=True)
+
+
+def check_update(root: Path, folder: Path) -> None:
     config = read_config(root)
     current = kit_version(root / "kit")
     if not current:
         raise HostError("this host was not installed from a release kit, so it cannot update itself.")
-    release = json.loads(fetch(f"{releases_api(config.get('update_repo', UPDATE_REPO))}/releases/latest"))
+    api = releases_api(config.get('update_repo', UPDATE_REPO))
+    release = json.loads(fetch(f"{api}/releases/latest"))
     tag = str(release.get("tag_name", ""))
     if not (tag.startswith("v") and VERSION_RE.fullmatch(tag[1:])):
         raise HostError(f"the latest release has an unexpected tag {tag!r}.")
@@ -765,6 +813,18 @@ def cmd_check_update(args: argparse.Namespace) -> None:
         raise HostError(f"release {tag} lacks {', '.join(missing)}.")
     meta = json.loads(fetch(urls[names["release"]]))
     lattice_latest = (meta.get("lattice") or {}).get("default")
+    # What each version since this host's brings, newest first. The list is
+    # only for reading; the latest release alone decides what is offered.
+    try:
+        listed = json.loads(fetch(f"{api}/releases?per_page=30"))
+    except (OSError, ValueError):
+        listed = []
+    notes = {}
+    for entry in [release, *(listed if isinstance(listed, list) else [])]:
+        found = release_notes(entry) if isinstance(entry, dict) else None
+        if found and found["version"] not in notes and version_key(current) < version_key(found["version"]) <= version_key(latest):
+            notes[found["version"]] = found
+    releases = sorted(notes.values(), key=lambda n: version_key(n["version"]), reverse=True)[:10]
     available = {
         "latest": latest,
         "tag": tag,
@@ -772,9 +832,10 @@ def cmd_check_update(args: argparse.Namespace) -> None:
         "lattice": {"current": config.get("version"), "latest": lattice_latest},
         "assets": {key: urls[name] for key, name in names.items()},
         "kitSha256": (meta.get("assets") or {}).get(names["kit"]),
+        "releases": releases,
         "checkedAt": int(time.time()),
     }
-    write_private_json(update_dir(root) / "available.json", available)
+    write_private_json(folder / "available.json", available)
     newer = version_key(latest) > version_key(current)
     say(f"lattice-web-ui {latest} is available (this host runs {current})." if newer else f"lattice-web-ui {current} is the latest release.")
 

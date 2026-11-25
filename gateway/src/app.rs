@@ -790,7 +790,9 @@ async fn route(app: Arc<App>, entrance: Entrance, req: Request<Incoming>) -> Res
             }
             let state = match &app.updates {
                 Some(updates) => updates.state(env!("CARGO_PKG_VERSION")),
-                None => json!({ "current": env!("CARGO_PKG_VERSION"), "available": false }),
+                None => {
+                    json!({ "current": env!("CARGO_PKG_VERSION"), "available": false, "updates": false })
+                }
             };
             return json_response(StatusCode::OK, state);
         }
@@ -1192,6 +1194,26 @@ async fn api(
                 &format!("The gateway could not record that: {e}"),
             ),
         },
+        "/__gateway/api/update/check" if owner => {
+            let Some(updates) = &app.updates else {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "no_updates",
+                    "This host was installed without updates from the browser.",
+                );
+            };
+            match updates.check() {
+                Ok(()) => json_response(
+                    StatusCode::ACCEPTED,
+                    updates.state(env!("CARGO_PKG_VERSION")),
+                ),
+                Err(reason) => error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "write_failed",
+                    &format!("The gateway could not record the request: {reason:?}"),
+                ),
+            }
+        }
         "/__gateway/api/update/start" | "/__gateway/api/update/dismiss" if owner => {
             let Some(updates) = &app.updates else {
                 return error(

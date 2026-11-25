@@ -11,6 +11,9 @@
 //!   outside the gateway, which it restarts.
 //! - `dismissed`: written here when the owner selects Later, the version
 //!   whose prompt stays hidden.
+//! - `check`: written here when the owner selects Check now. Another path
+//!   unit runs `lattice-host check-update`, which removes it, and writes
+//!   `check-failed.json` when it could not find out.
 
 use serde_json::{json, Value};
 use std::fs;
@@ -21,6 +24,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A running update that has said nothing for this long has died.
 const STALE_SECONDS: u64 = 15 * 60;
+/// A Check now that nothing answered in this long is given up on.
+const CHECK_SECONDS: u64 = 2 * 60;
+/// Check now does nothing when the last check is this recent.
+const FRESH_SECONDS: u64 = 20;
 
 pub struct Updates {
     dir: PathBuf,
@@ -62,6 +69,14 @@ impl Updates {
         !matches!(phase, "done" | "failed") && now().saturating_sub(at) < STALE_SECONDS
     }
 
+    fn checking(&self) -> bool {
+        fs::metadata(self.dir.join("check"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() < CHECK_SECONDS)
+    }
+
     /// What the owner's page shows.
     pub fn state(&self, current: &str) -> Value {
         let available = self.latest();
@@ -75,6 +90,7 @@ impl Updates {
             .ok()
             .map(|s| s.trim().to_string());
         json!({
+            "updates": true,
             "current": current,
             "latest": latest,
             "available": newer,
@@ -82,7 +98,24 @@ impl Updates {
             "lattice": available.as_ref().and_then(|v| v.get("lattice")).cloned(),
             "running": self.running(),
             "status": self.read_json("status.json"),
+            "checkedAt": available.as_ref().and_then(|v| v.get("checkedAt")).and_then(Value::as_u64),
+            "checking": self.checking(),
+            "checkFailed": self.read_json("check-failed.json"),
+            "releases": releases(available.as_ref(), current, latest.as_deref()),
         })
+    }
+
+    /// Ask lattice-host to look for a newer release now.
+    pub fn check(&self) -> Result<(), Refusal> {
+        let checked = self
+            .read_json("available.json")
+            .and_then(|v| v.get("checkedAt").and_then(Value::as_u64))
+            .unwrap_or(0);
+        if self.checking() || now().saturating_sub(checked) < FRESH_SECONDS {
+            return Ok(());
+        }
+        let _ = fs::remove_file(self.dir.join("check-failed.json"));
+        write_private(&self.dir.join("check"), &now().to_string()).map_err(Refusal::Io)
     }
 
     /// Ask lattice-host to update to `version`, the newest stable release.
@@ -108,6 +141,26 @@ impl Updates {
         }
         write_private(&self.dir.join("dismissed"), version).map_err(Refusal::Io)
     }
+}
+
+/// What each version newer than this one brings, as lattice-host found it.
+fn releases(available: Option<&Value>, current: &str, latest: Option<&str>) -> Value {
+    let list = available
+        .and_then(|v| v.get("releases"))
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter(|r| {
+                    r.get("version").and_then(Value::as_str).is_some_and(|v| {
+                        is_newer(v, current) && latest.is_some_and(|l| !is_newer(v, l))
+                    })
+                })
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Value::Array(list)
 }
 
 fn now() -> u64 {
@@ -240,5 +293,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updates.request("0.9.0", "0.8.3"), Err(Refusal::Running));
+    }
+
+    #[test]
+    fn check_now_asks_lattice_host_once_and_lists_newer_versions() {
+        let dir = dir();
+        let updates = Updates::new(dir.clone());
+        updates.check().unwrap();
+        assert!(dir.join("check").exists());
+        assert_eq!(updates.state("0.8.3")["checking"], true);
+        // lattice-host answers: the request goes, the result comes.
+        fs::remove_file(dir.join("check")).unwrap();
+        fs::write(
+            dir.join("available.json"),
+            format!(
+                r#"{{"latest":"0.9.0","checkedAt":{},"releases":[{{"version":"0.9.1"}},{{"version":"0.9.0","changes":["A"]}},{{"version":"0.8.9"}},{{"version":"0.8.3"}}]}}"#,
+                now()
+            ),
+        )
+        .unwrap();
+        let state = updates.state("0.8.3");
+        assert_eq!(state["checking"], false);
+        assert_eq!(state["releases"].as_array().unwrap().len(), 2);
+        assert_eq!(updates.state("0.8.9")["releases"][0]["version"], "0.9.0");
+        // Just checked: asking again does nothing.
+        updates.check().unwrap();
+        assert!(!dir.join("check").exists());
+        // A failure shows until the next request.
+        fs::write(
+            dir.join("available.json"),
+            r#"{"latest":"0.9.0","checkedAt":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("check-failed.json"),
+            r#"{"error":"offline","at":2}"#,
+        )
+        .unwrap();
+        assert_eq!(updates.state("0.8.3")["checkFailed"]["error"], "offline");
+        updates.check().unwrap();
+        assert!(dir.join("check").exists());
+        assert!(updates.state("0.8.3")["checkFailed"].is_null());
     }
 }
