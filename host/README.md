@@ -150,6 +150,17 @@ into the host directory if it is not installed.
   TinyTeX.
 - **Phones.** Below 700 px, Lattice gets one panel with every view as a tab.
   The wide layout comes back on a screen at least 900 px wide.
+- **The compiled PDF.** Lattice reads a project's PDF each time the project
+  is entered (a project tab, a reload) and again after each build, and sends
+  the whole file over its WebSocket every time
+  ([lattice-writer/lattice#1267](https://github.com/lattice-writer/lattice/issues/1267)).
+  The tab keeps the last PDFs it was sent, up to 100 MB, in the browser's
+  IndexedDB. Before each read it asks the gateway for the file's SHA-256: the
+  same file costs one small request, and a new one comes over plain HTTP.
+  The gateway answers only for signed-in browsers and only for projects in
+  the home folder. When a project has a `standalone` or `subfiles` document,
+  which Lattice may be showing instead of the main one, Lattice is asked as
+  before.
 
 ## Update and roll back
 

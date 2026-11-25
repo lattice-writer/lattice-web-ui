@@ -16,6 +16,7 @@ mod bridge;
 mod compress;
 mod downloads;
 mod files;
+mod pdf;
 mod proxy;
 mod store;
 mod tex;

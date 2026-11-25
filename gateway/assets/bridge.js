@@ -35,6 +35,14 @@
 //     file to import), are shown in the tab, made like Lattice's own dialogs:
 //     the Open panel browses the host's home folder through the gateway and
 //     uploads a file from this device into the folder it shows.
+// 14. The compiled PDF crosses the network once. Lattice reads it each time a
+//     project is entered (a tab click, a reload) and again after each build,
+//     the whole file every time. The tab keeps the PDFs it was sent (in
+//     IndexedDB, so a reload has them too) and asks the gateway for the
+//     file's fingerprint first: the same file costs one small request, and a
+//     new one comes as plain HTTP, not base64 inside Lattice's WebSocket.
+//     When the gateway cannot be sure which file Lattice reads, Lattice is
+//     asked as before.
 (() => {
   "use strict";
 
@@ -151,6 +159,152 @@
     link.remove();
   }
 
+  // The compiled PDF, kept by project folder and fingerprint (sha256 and
+  // size, the gateway's ETag for the file `read_compiled_pdf` reads). The
+  // gateway answers 304 when the tab names the file's tag, the bytes when it
+  // does not, and anything else (409: it cannot be sure which file Lattice
+  // reads; 404: Lattice would find none) leaves the read to Lattice. Kept
+  // bytes are checked against their tag before they are used, and a fresh
+  // copy goes to Lattice each time: pdf.js may hand a buffer to its worker.
+  const PDF_TAG = /^(?:W\/)?"sha256-([0-9a-f]{64})-(\d+)"$/;
+  const PDF_CAP = 100 * 1024 * 1024, PDF_COUNT = 8, PDF_PER_PROJECT = 2, PDF_MEMORY = 48 * 1024 * 1024;
+  const pdfKey = (root, tag) => `${root}\n${tag}`;
+  const pdfMemory = new Map();
+  let pdfDb, pdfIndex;
+  function openPdfDb() {
+    return (pdfDb ??= new Promise((resolve) => {
+      try {
+        const request = indexedDB.open("lattice-gateway-pdf", 1);
+        request.onupgradeneeded = () => {
+          request.result.createObjectStore("meta", { keyPath: "key" });
+          request.result.createObjectStore("bytes");
+        };
+        request.onsuccess = () => {
+          request.result.onversionchange = () => request.result.close();
+          resolve(request.result);
+        };
+        request.onerror = request.onblocked = () => resolve(null);
+      } catch { resolve(null); }
+    }));
+  }
+  // One transaction over both stores; `work` gets them and a setter for the
+  // result. Resolves once it commits, undefined when storage fails.
+  async function pdfStores(mode, work) {
+    const db = await openPdfDb();
+    if (!db) return undefined;
+    return new Promise((resolve) => {
+      let result;
+      try {
+        const tx = db.transaction(["meta", "bytes"], mode);
+        tx.oncomplete = () => resolve(result);
+        tx.onerror = tx.onabort = () => resolve(undefined);
+        work(tx.objectStore("meta"), tx.objectStore("bytes"), (value) => { result = value; });
+      } catch { resolve(undefined); }
+    });
+  }
+  const pdfIndexReady = () => (pdfIndex ??= pdfStores("readonly", (meta, _bytes, done) => {
+    const all = meta.getAll();
+    all.onsuccess = () => done(all.result);
+  }).then((list) => new Map((Array.isArray(list) ? list : [])
+    .filter((m) => m && typeof m.key === "string" && typeof m.root === "string" && PDF_TAG.test(m.tag))
+    .map((m) => [m.key, m]))).catch(() => new Map()));
+  function rememberPdf(key, bytes) {
+    pdfMemory.delete(key);
+    pdfMemory.set(key, bytes);
+    let total = 0;
+    for (const value of pdfMemory.values()) total += value.byteLength;
+    for (const [old, value] of pdfMemory) {
+      if (total <= PDF_MEMORY || old === key) break;
+      pdfMemory.delete(old);
+      total -= value.byteLength;
+    }
+  }
+  async function pdfMatches(bytes, tag) {
+    const [, sha, size] = PDF_TAG.exec(tag) || [];
+    if (!sha || !(bytes instanceof ArrayBuffer) || bytes.byteLength !== Number(size)) return false;
+    if (new TextDecoder().decode(new Uint8Array(bytes, 0, 5)) !== "%PDF-") return false;
+    // Without WebCrypto (a page not served securely) the size has to do.
+    if (!globalThis.crypto?.subtle) return true;
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("") === sha;
+  }
+  async function keptPdf(key) {
+    const held = pdfMemory.get(key) ?? await pdfStores("readonly", (_meta, bytes, done) => {
+      const read = bytes.get(key);
+      read.onsuccess = () => done(read.result);
+    });
+    if (!(held instanceof ArrayBuffer)) return null;
+    rememberPdf(key, held);
+    return held.slice(0);
+  }
+  // The newest per project, a few in all, the oldest dropped first.
+  function evictPdfs(index) {
+    const order = [...index.values()].sort((a, b) => b.at - a.at);
+    const perProject = new Map();
+    let total = 0, count = 0;
+    const dropped = [];
+    for (const m of order) {
+      const mine = (perProject.get(m.root) || 0) + 1;
+      perProject.set(m.root, mine);
+      if (mine > PDF_PER_PROJECT || count + 1 > PDF_COUNT || total + m.size > PDF_CAP) { dropped.push(m.key); continue; }
+      total += m.size;
+      count += 1;
+    }
+    for (const key of dropped) { index.delete(key); pdfMemory.delete(key); }
+    return dropped;
+  }
+  function keepPdf(index, root, tag, bytes) {
+    const key = pdfKey(root, tag);
+    const entry = { key, root, tag, size: bytes.byteLength, at: Date.now() };
+    index.set(key, entry);
+    const dropped = evictPdfs(index);
+    if (dropped.includes(key)) return;
+    rememberPdf(key, bytes);
+    void pdfStores("readwrite", (meta, store) => {
+      meta.put(entry);
+      store.put(bytes, key);
+      for (const old of dropped) { meta.delete(old); store.delete(old); }
+    });
+  }
+  function touchPdf(index, root, tag) {
+    const entry = index.get(pdfKey(root, tag));
+    if (!entry) return;
+    entry.at = Date.now();
+    void pdfStores("readwrite", (meta) => { meta.put(entry); });
+  }
+  const fetchCompiledPdf = (root, tags) => fetch(`/__gateway/api/compiled-pdf?root=${encodeURIComponent(root)}`, {
+    credentials: "same-origin", cache: "no-store",
+    headers: tags.length ? { "If-None-Match": tags.join(", ") } : {},
+  });
+  async function compiledPdf(root, ask) {
+    try {
+      const index = await pdfIndexReady();
+      const held = [...index.values()].filter((m) => m.root === root).sort((a, b) => b.at - a.at).map((m) => m.tag);
+      let response = await fetchCompiledPdf(root, held);
+      if (response.status === 304) {
+        const tag = (response.headers.get("ETag") || "").replace(/^W\//, "");
+        const bytes = held.includes(tag) ? await keptPdf(pdfKey(root, tag)) : null;
+        if (bytes && await pdfMatches(bytes, tag)) {
+          touchPdf(index, root, tag);
+          return bytes;
+        }
+        // Gone from storage, or not what it should be: the file itself.
+        index.delete(pdfKey(root, tag));
+        pdfMemory.delete(pdfKey(root, tag));
+        response = await fetchCompiledPdf(root, []);
+      }
+      if (response.status === 200) {
+        const tag = (response.headers.get("ETag") || "").replace(/^W\//, "");
+        const bytes = await response.arrayBuffer();
+        if (await pdfMatches(bytes, tag)) {
+          keepPdf(index, root, tag, bytes.slice(0));
+          return bytes;
+        }
+      }
+    } catch { /* Lattice answers */ }
+    return ask();
+  }
+
   // Message, confirm and Open dialogs shown in this tab (filled in below).
   const tabDialogs = { message: null, open: null };
 
@@ -186,6 +340,9 @@
             const shown = await invoke("project_shown_elsewhere", { path: args?.path }).catch(() => false);
             if (shown === true) await releaseFromHiddenWindow(invoke, args?.path);
             return invoke(command, args, options);
+          }
+          if (command === "read_compiled_pdf" && typeof args?.projectRoot === "string" && args.projectRoot.startsWith("/")) {
+            return compiledPdf(args.projectRoot, () => invoke(command, args, options));
           }
           if (command === "plugin:dialog|message" && tabDialogs.message) return tabDialogs.message(args);
           if (command === "plugin:dialog|open" && tabDialogs.open) return tabDialogs.open(args?.options);
