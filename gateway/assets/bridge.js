@@ -31,6 +31,10 @@
 // 12. "Save … as" (a PDF, a review copy, a project archive) downloads the file
 //     to this device, instead of asking for a place on the host's disk in a
 //     panel on its display.
+// 13. Lattice's message and confirm dialogs, and its Open panels (a folder, a
+//     file to import), are shown in the tab, made like Lattice's own dialogs:
+//     the Open panel browses the host's home folder through the gateway and
+//     uploads a file from this device into the folder it shows.
 (() => {
   "use strict";
 
@@ -147,6 +151,9 @@
     link.remove();
   }
 
+  // Message, confirm and Open dialogs shown in this tab (filled in below).
+  const tabDialogs = { message: null, open: null };
+
   // Lattice installs its IPC adapter on window.__TAURI_INTERNALS__; wrap its invoke as it arrives.
   let internals;
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
@@ -180,6 +187,8 @@
             if (shown === true) await releaseFromHiddenWindow(invoke, args?.path);
             return invoke(command, args, options);
           }
+          if (command === "plugin:dialog|message" && tabDialogs.message) return tabDialogs.message(args);
+          if (command === "plugin:dialog|open" && tabDialogs.open) return tabDialogs.open(args?.options);
           if (command === "plugin:dialog|save") {
             // Nothing chosen (as if cancelled) rather than a panel nobody sees.
             return downloadDestination(args).catch(() => null);
@@ -881,7 +890,8 @@
     style.textContent = `
       [data-gateway-dialog] .settings-modal { width: min(640px, calc(100vw - 32px)); height: auto; max-height: min(760px, calc(100dvh - 48px)); display: flex; flex-direction: column; background: var(--surface-panel); }
       [data-gateway-dialog] { outline: none; }
-      [data-gateway-dialog], [data-gateway-dialog-backdrop] { z-index: 2147483647; }
+      .modal-backdrop[data-gateway-dialog-backdrop] { z-index: 2147483646; }
+      .modal-dialog-content[data-gateway-dialog] { z-index: 2147483647; }
       [data-gateway-dialog] .settings-content { overflow-y: auto; overscroll-behavior: contain; }
       [data-gateway-dialog] .settings-section { max-width: none; }
       [data-gateway-page] .phone-badge { margin-inline-start: var(--space-3); padding: 1px 6px; border-radius: 999px; background: var(--control-active-soft); color: var(--control-active); font-size: var(--type-micro-size, 11px); font-weight: var(--weight-semibold, 600); vertical-align: 1px; }
@@ -889,6 +899,7 @@
       [data-gateway-page="version"] .version-changes { margin: var(--space-2, 4px) 0 0; padding-inline-start: 1.1em; color: var(--text-secondary); font-size: var(--type-caption-size, 12px); line-height: 1.55; }
       [data-gateway-page="version"] .version-changes li::marker { color: var(--text-tertiary); }
       [data-gateway-page="version"] .version-external { display: inline-flex; margin-inline-start: 4px; }
+      [data-gateway-page="version"] .version-github { display: inline-flex; margin-inline-end: 6px; }
       [data-gateway-page] a.ui-button, [data-gateway-page] a.ui-icon-button, [data-lattice-gateway="version-row"] a { text-decoration: none; }
       /* Settings' pane shows the gateway's page in place of Lattice's. */
       .settings-modal[data-gateway-page] .settings-content [data-slot="scroll-area-content"] > :not(.settings-back):not([data-gateway-page]) { display: none; }
@@ -1079,7 +1090,9 @@
       if (!nav || getComputedStyle(nav).display !== "none") return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      leavePage(true);
+      // Lattice's own back button, so its idea of the open page follows too.
+      const back = page.modal.querySelector(".settings-back");
+      if (back) back.click(); else leavePage(true);
     }, true);
 
     // "Version": what this host runs, the update on offer, what it brings,
@@ -1137,6 +1150,7 @@
       available: "Updates available",
     };
     const RELEASES = "https://github.com/lattice-writer/lattice-web-ui/releases";
+    const GITHUB_MARK = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>';
     const EXTERNAL = '<path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>';
     const REFRESH = '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path>';
     const ago = (seconds) => {
@@ -1226,7 +1240,7 @@
             el("div", { class: "ui-settings-section-header-copy" }, el("h2", { class: "ui-settings-section-header-title" }, V.title)),
             el("div", { class: "ui-settings-section-header-actions" },
               el("a", { class: "ui-button ui-button--ghost ui-button--compact", "data-slot": "button", "data-size": "compact", "data-variant": "ghost", href: RELEASES, target: "_blank", rel: "noopener noreferrer" },
-                V.releases, el("span", { class: "version-external", html: svg(EXTERNAL, 12) })))),
+                el("span", { class: "version-github", html: GITHUB_MARK }), V.releases, el("span", { class: "version-external", html: svg(EXTERNAL, 12) })))),
           group(V.updatesGroup,
             versionRow(state, "Lattice-web-ui"),
             lattice.current ? row(V.lattice, `${lattice.current} · ${V.latticeDetail}`) : null),
@@ -1282,12 +1296,37 @@
       navStyle.textContent = `
         .settings-nav:has(.settings-search-results) [data-lattice-gateway="settings-group"] { display: none; }
         [data-setting="version"][data-gateway-replaced] { display: none; }
+        .gw-phone .ph-body, .gw-version .up-arrow { transform-box: view-box; transform-origin: 128px 128px; }
+        @keyframes gw-phone-buzz {
+          0% { transform: rotate(0deg); animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
+          12% { transform: rotate(-14deg); } 24% { transform: rotate(11deg); } 36% { transform: rotate(-8deg); }
+          48% { transform: rotate(5deg); } 60% { transform: rotate(-2deg); }
+          72%, 100% { transform: rotate(0deg); }
+        }
+        @keyframes gw-version-up {
+          0% { transform: translateY(0px); animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
+          22% { transform: translateY(-30px); animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
+          44% { transform: translateY(6px); animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
+          62% { transform: translateY(-14px); animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
+          80%, 100% { transform: translateY(0px); }
+        }
+        .bakai-icon.is-playing:not(.is-reduced) .gw-phone .ph-body { animation: gw-phone-buzz 0.9s both; }
+        .bakai-icon.is-playing:not(.is-reduced) .gw-version .up-arrow { animation: gw-version-up 1.1s both; }
       `;
       document.head.append(navStyle);
       // Lucide at Lattice's own icons' weight (1.6 at 15px, like its Phosphor set).
       const icon = (paths, size, cls, width = 1.6) => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" class="${cls}" aria-hidden="true">${paths}</svg>`;
-      const item = (kind, label, paths, open, badge = false) => el("button", { type: "button", "data-lattice-gateway": kind === "phone" ? "settings-item" : "settings-version", "data-gateway-page-item": kind, onclick: open,
-        html: icon(paths, 15, "animated-product-icon")
+      const navIcon = (kind, paths) => `<span class="animated-product-icon animated-product-icon--gw-${kind}" aria-hidden="true" style="pointer-events: none;"><span class="bakai-icon"><svg width="15" height="15" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" class="gw-${kind}">${paths}</svg></span></span>`;
+      const replay = (event) => {
+        const glyph = event.currentTarget.querySelector(".bakai-icon");
+        if (!glyph) return;
+        glyph.classList.remove("is-playing");
+        glyph.classList.toggle("is-reduced", matchMedia("(prefers-reduced-motion: reduce)").matches);
+        void glyph.offsetWidth;
+        glyph.classList.add("is-playing");
+      };
+      const item = (kind, label, paths, open, badge = false) => el("button", { type: "button", "data-lattice-gateway": kind === "phone" ? "settings-item" : "settings-version", "data-gateway-page-item": kind, onclick: open, onpointerenter: replay, onfocus: replay,
+        html: navIcon(kind, paths)
           + `<span title="${label}">${label}</span>`
           + (badge ? `<span class="settings-nav-badge" role="img" aria-label="${V.available}" hidden></span>` : "")
           + icon('<path d="m9 18 6-6-6-6"></path>', 14, "settings-nav-chevron") });
@@ -1300,8 +1339,8 @@
         if (!group) {
           group = el("div", { class: "settings-nav-group", role: "group", "aria-label": "Lattice-web-ui", "data-lattice-gateway": "settings-group" },
             el("div", { class: "settings-nav-group-label" }, "Lattice-web-ui"),
-            item("phone", V.phoneNav, '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"></rect><path d="M12 18h.01"></path>', () => show(true)),
-            item("version", V.nav, '<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"></path><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"></circle>', () => showVersion(), true));
+            item("phone", V.phoneNav, '<g class="ph-body"><rect x="64" y="24" width="128" height="208" rx="16"></rect><path d="M64 56H192"></path><path d="M64 200H192"></path></g>', () => show(true)),
+            item("version", V.nav, '<circle cx="128" cy="128" r="96"></circle><g class="up-arrow"><path d="M94 122L128 88L162 122"></path><path d="M128 168V88"></path></g>', () => showVersion(), true));
           markNav();
         }
         const badge = group.querySelector(".settings-nav-badge");
@@ -1348,6 +1387,283 @@
         }, 9000);
       })
       .catch(() => {});
+  })();
+
+  // Lattice's message and confirm dialogs, and its Open panels, shown in this
+  // tab: their native panels would open on the host's display, which nobody
+  // sees, and the tab would wait for an answer that never comes. The dialogs
+  // use Lattice's own confirm dialog markup (confirm-action-dialog.tsx); the
+  // Open panel browses the host's home folder through the gateway.
+  (() => {
+    const T = zhUI ? {
+      ok: "确定", cancel: "取消", yes: "是", no: "否",
+      chooseFolder: "选择文件夹", chooseFile: "选择文件", chooseFiles: "选择文件",
+      useFolder: "选择此文件夹", open: "打开", newFolder: "新建文件夹", upload: "从此设备上传…",
+      folderName: "文件夹名称", create: "新建", home: "主文件夹", empty: "这里没有可选的内容。",
+      uploading: (done, total) => `正在上传 ${done} / ${total}…`, failed: "出错了：", project: "项目",
+      truncated: "这里的内容太多，只列出了前 2000 项。",
+    } : {
+      ok: "OK", cancel: "Cancel", yes: "Yes", no: "No",
+      chooseFolder: "Choose a folder", chooseFile: "Choose a file", chooseFiles: "Choose files",
+      useFolder: "Choose this folder", open: "Open", newFolder: "New folder", upload: "Upload from this device…",
+      folderName: "Folder name", create: "Create", home: "Home", empty: "Nothing to choose here.",
+      uploading: (done, total) => `Uploading ${done} of ${total}…`, failed: "Something went wrong: ", project: "Project",
+      truncated: "This folder holds too much; the first 2,000 entries are listed.",
+    };
+    const svg = (paths, size = 15) => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
+    const FOLDER = '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path>';
+    const FILE = '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"></path><path d="M14 2v4a2 2 0 0 0 2 2h4"></path>';
+    const CHECK = '<path d="M20 6 9 17l-5-5"></path>';
+    const el = (tag, props = {}, ...children) => {
+      const node = document.createElement(tag);
+      for (const [key, value] of Object.entries(props)) {
+        if (key === "class") node.className = value;
+        else if (key === "html") node.innerHTML = value;
+        else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+        else if (value !== undefined && value !== null && value !== false) node.setAttribute(key, value === true ? "" : value);
+      }
+      for (const child of children.flat()) if (child !== null && child !== undefined && child !== false) node.append(child);
+      return node;
+    };
+    const button = (label, variant, onclick) =>
+      el("button", { type: "button", class: `ui-button ui-button--${variant}`, "data-slot": "button", "data-variant": variant, onclick }, label);
+    const api = async (path, body) => {
+      const response = await fetch(path, {
+        method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const value = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(value?.error?.message || `HTTP ${response.status}`);
+      return value;
+    };
+
+    const style = el("style", { "data-lattice-gateway": "tab-dialog-style" });
+    style.textContent = `
+      /* Above Lattice's own layers; .modal-dialog-content's z-index would otherwise win and leave the card under its backdrop. */
+      .modal-backdrop[data-lattice-gateway="tab-dialog-backdrop"] { z-index: 2147483645; }
+      .modal-dialog-content[data-lattice-gateway="tab-dialog"] { z-index: 2147483646; }
+      [data-lattice-gateway="tab-dialog"] { outline: none; }
+      .gw-picker { width: min(560px, calc(100vw - 24px)); display: flex; flex-direction: column; max-height: min(640px, calc(100dvh - 48px)); }
+      .gw-picker > h2 { margin-bottom: var(--space-4); }
+      .gw-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin: 0 0 var(--space-4); font-size: var(--type-caption-size); color: var(--text-secondary); }
+      .gw-crumbs button { padding: 2px 6px; border-radius: var(--radius-control); background: transparent; color: inherit; font: inherit; cursor: pointer; }
+      .gw-crumbs button:hover { background: var(--control-hover-surface); color: var(--text-primary); }
+      .gw-crumbs button[aria-current] { color: var(--text-primary); font-weight: var(--weight-semibold, 600); }
+      .gw-crumbs span { color: var(--text-tertiary); }
+      .gw-list { flex: 1 1 auto; min-height: 160px; overflow-y: auto; overscroll-behavior: contain; margin: 0 calc(var(--space-4) * -1); padding: var(--space-2) var(--space-4); border-block: 1px solid var(--border-subtle); }
+      .gw-row { width: 100%; min-height: 32px; display: flex; align-items: center; gap: var(--space-4); padding: 0 var(--space-4); border-radius: var(--radius-control); background: transparent; color: var(--text-primary); font-size: var(--type-body-compact-size, 13px); text-align: left; cursor: pointer; }
+      .gw-row:hover { background: var(--control-hover-surface); }
+      .gw-row[aria-selected="true"] { background: var(--control-active-soft); color: var(--control-active); }
+      .gw-row > svg { flex: none; color: var(--text-tertiary); }
+      .gw-row[aria-selected="true"] > svg { color: currentColor; }
+      .gw-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .gw-row-meta { flex: none; color: var(--text-tertiary); font-size: var(--type-caption-size); font-variant-numeric: tabular-nums; }
+      .gw-empty { padding: var(--space-8) var(--space-4); color: var(--text-tertiary); font-size: var(--type-caption-size); text-align: center; }
+      .gw-new { display: flex; gap: var(--space-3); padding: var(--space-2) 0 var(--space-3); }
+      .gw-new input { flex: 1; min-width: 0; }
+      .gw-status { margin: var(--space-4) 0 0; font-size: var(--type-caption-size); color: var(--text-secondary); }
+      .gw-status[data-tone="danger"] { color: var(--status-danger); }
+      .gw-picker .modal-actions { margin-top: var(--space-6); flex-wrap: wrap; }
+      .gw-picker .modal-actions .gw-left { margin-right: auto; }
+      @media (max-width: 560px) { .gw-picker .modal-actions .gw-left { width: 100%; justify-content: flex-start; } }
+      @media (pointer: coarse) { .gw-row { min-height: 40px; } }
+    `;
+
+    // One dialog at a time, made like Lattice's ModalDialog: backdrop, card, Escape closes.
+    let current = null;
+    function present(card, label, onEscape) {
+      if (!style.isConnected) document.head.append(style);
+      current?.close();
+      const backdrop = el("div", { class: "modal-backdrop confirm-action-backdrop", "data-lattice-gateway": "tab-dialog-backdrop" });
+      const dialog = el("div", { class: "modal-dialog-content", "data-lattice-gateway": "tab-dialog", role: "dialog", "aria-modal": "true", "aria-label": label, tabindex: "-1" }, card);
+      const returnTo = document.activeElement;
+      const keydown = (event) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onEscape();
+      };
+      const close = () => {
+        backdrop.remove();
+        dialog.remove();
+        removeEventListener("keydown", keydown, true);
+        if (current?.dialog === dialog) current = null;
+        if (returnTo?.isConnected) returnTo.focus?.({ preventScroll: true });
+      };
+      backdrop.addEventListener("click", onEscape);
+      addEventListener("keydown", keydown, true);
+      document.body.append(backdrop, dialog);
+      current = { dialog, close };
+      return { dialog, close };
+    }
+
+    // plugin:dialog|message, which message(), ask() and confirm() all send:
+    // answered with the name of the button pressed, as the plugin does.
+    tabDialogs.message = ({ message, title, kind, buttons } = {}) => new Promise((resolve) => {
+      let actions;
+      if (buttons === "OkCancel") actions = [["Cancel", T.cancel, "ghost"], ["Ok", T.ok, "primary"]];
+      else if (buttons === "YesNo") actions = [["No", T.no, "ghost"], ["Yes", T.yes, "primary"]];
+      else if (buttons === "YesNoCancel") actions = [["Cancel", T.cancel, "ghost"], ["No", T.no, "secondary"], ["Yes", T.yes, "primary"]];
+      else if (Array.isArray(buttons?.OkCancelCustom)) actions = [[buttons.OkCancelCustom[1], buttons.OkCancelCustom[1], "ghost"], [buttons.OkCancelCustom[0], buttons.OkCancelCustom[0], "primary"]];
+      else if (Array.isArray(buttons?.YesNoCancelCustom)) {
+        const [yes, no, cancel] = buttons.YesNoCancelCustom;
+        actions = [[cancel, cancel, "ghost"], [no, no, "secondary"], [yes, yes, "primary"]];
+      } else if (typeof buttons?.OkCustom === "string") actions = [[buttons.OkCustom, buttons.OkCustom, "primary"]];
+      else actions = [["Ok", T.ok, "primary"]];
+      // Escape and the backdrop give the cautious answer: the first button.
+      const cautious = actions[0][0];
+      let shown;
+      const settle = (answer) => { shown.close(); resolve(answer); };
+      const card = el("div", { class: "modal confirm-action-modal", "data-has-alternative": actions.length > 2 ? "true" : null, "data-kind": kind || null },
+        el("h2", {}, typeof title === "string" && title ? title : "Lattice"),
+        typeof message === "string" && message ? el("p", {}, message) : null,
+        el("div", { class: "modal-actions" }, actions.map(([answer, label, variant]) => button(label, variant, () => settle(answer)))));
+      shown = present(card, typeof title === "string" && title ? title : "Lattice", () => settle(cautious));
+      card.querySelector(".ui-button--primary")?.focus({ preventScroll: true });
+    });
+
+    const size = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KB`
+      : bytes < 1073741824 ? `${(bytes / 1048576).toFixed(1)} MB` : `${(bytes / 1073741824).toFixed(2)} GB`;
+
+    // A file sent to `folder` on the host, with progress; resolves its host path.
+    const sendFile = (file, folder, progress) => new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open("POST", "/__gateway/api/upload");
+      request.withCredentials = true;
+      request.setRequestHeader("X-Upload-Folder", encodeURIComponent(folder));
+      request.setRequestHeader("X-Upload-Name", encodeURIComponent(file.name));
+      request.upload.onprogress = (event) => progress(event.loaded);
+      request.onload = () => {
+        let value = {};
+        try { value = JSON.parse(request.responseText); } catch { /* not JSON */ }
+        if (request.status === 200 && typeof value.path === "string") resolve(value.path);
+        else reject(new Error(value?.error?.message || `HTTP ${request.status}`));
+      };
+      request.onerror = () => reject(new Error("network"));
+      request.send(file);
+    });
+
+    // plugin:dialog|open: a folder, a file or several, on the host. Resolves
+    // a path, a list of paths, or null when cancelled.
+    tabDialogs.open = (options = {}) => new Promise((resolve) => {
+      const directory = options.directory === true;
+      const multiple = options.multiple === true && !directory;
+      const extensions = (Array.isArray(options.filters) ? options.filters : [])
+        .flatMap((filter) => (Array.isArray(filter?.extensions) ? filter.extensions : []))
+        .filter((ext) => typeof ext === "string");
+      let shown;
+      let listing = null;
+      const chosen = new Set();
+      const finish = (value) => { shown.close(); resolve(value); };
+      const cancel = () => finish(null);
+
+      const heading = el("h2", {}, typeof options.title === "string" && options.title ? options.title
+        : directory ? T.chooseFolder : multiple ? T.chooseFiles : T.chooseFile);
+      const crumbs = el("nav", { class: "gw-crumbs", "aria-label": T.home });
+      const list = el("div", { class: "gw-list", role: "listbox", "aria-multiselectable": multiple ? "true" : null });
+      const status = el("p", { class: "gw-status", hidden: true, role: "status" });
+      const primary = button(directory ? T.useFolder : T.open, "primary", () => {
+        if (directory) finish(listing?.path ?? null);
+        else if (chosen.size) finish(multiple ? [...chosen] : [...chosen][0]);
+      });
+      const say = (text, tone) => { status.textContent = text; status.hidden = !text; if (tone) status.dataset.tone = tone; else delete status.dataset.tone; };
+      const refresh = () => { primary.disabled = directory ? !listing : chosen.size === 0; };
+
+      const input = el("input", { type: "file", hidden: true, multiple: multiple ? true : null,
+        accept: extensions.length ? extensions.map((ext) => `.${ext}`).join(",") : null });
+      input.addEventListener("change", async () => {
+        const files = [...input.files];
+        input.value = "";
+        if (!files.length || !listing) return;
+        const total = files.reduce((sum, file) => sum + file.size, 0);
+        let before = 0;
+        const paths = [];
+        primary.disabled = true;
+        try {
+          for (const file of files) {
+            paths.push(await sendFile(file, listing.path, (loaded) => say(T.uploading(size(before + loaded), size(total)))));
+            before += file.size;
+          }
+        } catch (error) {
+          say(T.failed + error.message, "danger");
+          await go(listing.path);
+          return;
+        }
+        say("");
+        // What was uploaded is what was chosen.
+        finish(multiple ? paths : paths[0]);
+      });
+
+      let newRow = null;
+      const newFolder = () => {
+        if (newRow) { newRow.querySelector("input").focus(); return; }
+        const field = el("input", { class: "ui-input", "data-slot": "input", placeholder: T.folderName, "aria-label": T.folderName });
+        const make = async () => {
+          const name = field.value.trim();
+          if (!name || !listing) return;
+          try {
+            const made = await api("/__gateway/api/files/folder", { path: listing.path, name });
+            newRow?.remove(); newRow = null;
+            await go(made.path);
+          } catch (error) { say(T.failed + error.message, "danger"); }
+        };
+        field.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); make(); } });
+        newRow = el("div", { class: "gw-new" }, field, button(T.create, "secondary", make));
+        list.before(newRow);
+        field.focus();
+      };
+      const left = el("div", { class: "gw-left" },
+        directory ? button(T.newFolder, "ghost", newFolder) : button(T.upload, "ghost", () => input.click()));
+
+      function draw() {
+        crumbs.replaceChildren();
+        const home = listing.home;
+        const rest = listing.path === home ? [] : listing.path.slice(home.length + 1).split("/");
+        const steps = [[T.home, home], ...rest.map((name, i) => [name, `${home}/${rest.slice(0, i + 1).join("/")}`])];
+        steps.forEach(([name, path], i) => {
+          if (i) crumbs.append(el("span", { "aria-hidden": "true" }, "/"));
+          crumbs.append(el("button", { type: "button", "aria-current": i === steps.length - 1 ? "location" : null, onclick: () => go(path) }, name));
+        });
+        list.replaceChildren();
+        for (const entry of listing.entries) {
+          const path = `${listing.path}/${entry.name}`;
+          const folder = entry.kind === "folder";
+          const row = el("button", { type: "button", class: "gw-row", role: "option", "aria-selected": chosen.has(path) ? "true" : "false",
+            html: svg(folder ? FOLDER : chosen.has(path) && multiple ? CHECK : FILE) },
+          el("span", { class: "gw-row-name" }, entry.name),
+          folder && entry.project ? el("span", { class: "gw-row-meta" }, T.project) : null,
+          !folder ? el("span", { class: "gw-row-meta" }, size(entry.size)) : null);
+          row.addEventListener("click", () => {
+            if (folder) { go(path); return; }
+            if (!multiple) chosen.clear();
+            if (chosen.has(path)) chosen.delete(path); else chosen.add(path);
+            draw();
+          });
+          if (!folder) row.addEventListener("dblclick", () => { chosen.clear(); chosen.add(path); finish(multiple ? [path] : path); });
+          list.append(row);
+        }
+        if (!listing.entries.length) list.append(el("p", { class: "gw-empty" }, T.empty));
+        if (listing.truncated) say(T.truncated);
+        refresh();
+      }
+      async function go(path, start = false) {
+        try {
+          listing = await api("/__gateway/api/files", { path, start, files: !directory, extensions });
+          if (!multiple) chosen.clear();
+          draw();
+          list.scrollTop = 0;
+        } catch (error) {
+          say(T.failed + error.message, "danger");
+        }
+      }
+
+      const card = el("div", { class: "modal gw-picker" }, heading, crumbs, list, status,
+        el("div", { class: "modal-actions" }, left, button(T.cancel, "ghost", cancel), primary), input);
+      shown = present(card, heading.textContent, cancel);
+      refresh();
+      shown.dialog.focus({ preventScroll: true });
+      go(typeof options.defaultPath === "string" ? options.defaultPath : null, true);
+    });
   })();
 
 })();

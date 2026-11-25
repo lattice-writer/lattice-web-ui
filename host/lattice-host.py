@@ -780,15 +780,18 @@ def cmd_check_update(args: argparse.Namespace) -> None:
     """Look for a newer stable kit; the gateway shows the owner what is found."""
     root: Path = args.root
     folder = update_dir(root)
-    # The owner's Check now: this run answers it.
-    (folder / "check").unlink(missing_ok=True)
+    # The owner's Check now: this run answers it. The request stays until the
+    # answer is written, because the page reads it as "still checking".
     try:
         check_update(root, folder)
     except (HostError, OSError, ValueError) as error:
         reason = str(error) if isinstance(error, HostError) else f"could not read the latest release from GitHub ({error})."
         write_private_json(folder / "check-failed.json", {"error": reason[:300], "at": int(time.time())})
         raise HostError(reason) from error
-    (folder / "check-failed.json").unlink(missing_ok=True)
+    else:
+        (folder / "check-failed.json").unlink(missing_ok=True)
+    finally:
+        (folder / "check").unlink(missing_ok=True)
 
 
 def check_update(root: Path, folder: Path) -> None:

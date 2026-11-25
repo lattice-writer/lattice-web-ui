@@ -142,22 +142,29 @@ fn gzip(plain: &[u8]) -> std::io::Result<Vec<u8>> {
 }
 
 /// `gzip` listed in Accept-Encoding without `q=0`.
+/// Whether `Accept-Encoding` allows gzip: its own entry decides, and only
+/// without one does a `*` entry (RFC 9110 §12.5.3).
 fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
+    let mut gzip = None;
+    let mut any = None;
+    for item in headers
         .get_all(header::ACCEPT_ENCODING)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .any(|item| {
-            let mut fields = item.split(';').map(str::trim);
-            let name = fields.next().unwrap_or("");
-            let refused = fields.any(|f| {
-                f.strip_prefix("q=")
-                    .and_then(|q| q.parse::<f32>().ok())
-                    .is_some_and(|q| q == 0.0)
-            });
-            (name.eq_ignore_ascii_case("gzip") || name == "*") && !refused
-        })
+    {
+        let mut fields = item.split(';').map(str::trim);
+        let name = fields.next().unwrap_or("");
+        let weight = fields
+            .find_map(|f| f.strip_prefix("q=").and_then(|q| q.parse::<f32>().ok()))
+            .unwrap_or(1.0);
+        if name.eq_ignore_ascii_case("gzip") {
+            gzip = Some(weight);
+        } else if name == "*" {
+            any = Some(weight);
+        }
+    }
+    gzip.or(any).is_some_and(|weight| weight > 0.0)
 }
 
 /// Text, scripts, JSON, SVG, manifests and fonts that are not compressed
@@ -385,5 +392,10 @@ mod tests {
         assert!(!check("gzip;q=0, br"));
         assert!(!check("br, deflate"));
         assert!(!check("identity"));
+        // gzip's own entry beats the wildcard, either way round.
+        assert!(!check("gzip;q=0, *;q=1"));
+        assert!(!check("*, gzip;q=0"));
+        assert!(check("*;q=0, gzip"));
+        assert!(!check("*;q=0"));
     }
 }

@@ -15,6 +15,7 @@ mod app;
 mod bridge;
 mod compress;
 mod downloads;
+mod files;
 mod proxy;
 mod store;
 mod tex;

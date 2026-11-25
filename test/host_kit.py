@@ -296,6 +296,23 @@ class SelfUpdateTest(unittest.TestCase):
         self.assertEqual(releases[0]["url"], "https://github.com/lattice-writer/lattice-web-ui/releases/tag/v0.9.0")
         self.assertEqual(releases[1]["url"], "")
 
+    def test_check_now_stays_requested_until_the_answer_is_written(self):
+        folder = self.root / "state/update"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "check").write_text("1")
+        seen = []
+        real = self.tool.write_private_json
+        def spy(path, value):
+            seen.append((path.name, (folder / "check").exists()))
+            real(path, value)
+        self.tool.write_private_json = spy
+        try:
+            self.assertEqual(self.run_tool("check-update"), 0)
+        finally:
+            self.tool.write_private_json = real
+        self.assertIn(("available.json", True), seen, "the page still sees the check running while the answer is written")
+        self.assertFalse((folder / "check").exists())
+
     def test_check_now_is_answered_and_a_failure_is_recorded(self):
         folder = self.root / "state/update"
         folder.mkdir(parents=True, exist_ok=True)
