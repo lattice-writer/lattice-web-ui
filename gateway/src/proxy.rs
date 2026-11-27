@@ -44,12 +44,15 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-/// Cookies the gateway owns. They never reach Lattice.
+/// Cookies the gateway and its page script own. They never reach Lattice.
+/// `lattice-web-ui-install` is the bridge's per-browser install state (a
+/// cookie because Lattice copies localStorage between devices).
 pub const GATEWAY_COOKIES: &[&str] = &[
     "__Host-lattice_device",
     "__Host-lattice_owner",
     "lattice_device",
     "lattice_owner",
+    "lattice-web-ui-install",
 ];
 
 /// Largest script the gateway will hold in memory to rewrite (Lattice's biggest is about 1.3 MB).
@@ -432,7 +435,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            HeaderValue::from_static("a=1; __Host-lattice_device=abc; b=2"),
+            HeaderValue::from_static(
+                "a=1; __Host-lattice_device=abc; b=2; lattice-web-ui-install=%7B%7D",
+            ),
         );
         filter_cookies(&mut headers);
         assert_eq!(headers.get(header::COOKIE).unwrap(), "a=1; b=2");

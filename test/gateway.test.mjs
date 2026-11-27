@@ -482,6 +482,28 @@ test("Check now: only the owner asks lattice-host to look again", { skip }, asyn
   rmSync(join(update, "check"));
 });
 
+test("Install app: the manifest and icons a browser installs from, to anyone", { skip }, async () => {
+  // Chrome fetches the manifest without cookies, so it has to be public.
+  const response = await fetch(`${base}/__gateway/brand/manifest.webmanifest`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /^application\/manifest\+json/);
+  const manifest = await response.json();
+  assert.equal(manifest.display, "standalone");
+  assert.deepEqual(manifest.launch_handler, { client_mode: ["navigate-existing", "auto"] }, "a launch reuses the open window");
+  const maskable = manifest.icons.filter((icon) => icon.purpose === "maskable");
+  assert.deepEqual(maskable.map((icon) => icon.sizes), ["192x192", "512x512"]);
+  for (const icon of manifest.icons) {
+    const served = await fetch(`${base}${icon.src}`);
+    assert.equal(served.status, 200, icon.src);
+    assert.equal(served.headers.get("content-type"), icon.type, icon.src);
+    if (icon.type === "image/png") {
+      const bytes = Buffer.from(await served.arrayBuffer());
+      const [width, height] = [bytes.readUInt32BE(16), bytes.readUInt32BE(20)];
+      assert.equal(`${width}x${height}`, icon.sizes, `${icon.src} is the size it says`);
+    }
+  }
+});
+
 test("Phone and app: the owner's address code, the one-time hint, and the devices address", { skip }, async () => {
   assert.equal((await fetch(`${base}/__gateway/api/phone`)).status, 401);
   const owner = cookieOf(await post("/__gateway/api/login", { token }));

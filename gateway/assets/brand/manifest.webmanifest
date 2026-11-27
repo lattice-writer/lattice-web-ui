@@ -6,11 +6,14 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
+  "launch_handler": { "client_mode": ["navigate-existing", "auto"] },
   "background_color": "#f7f2e8",
   "theme_color": "#f7f2e8",
   "icons": [
     { "src": "/__gateway/brand/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "/__gateway/brand/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/__gateway/brand/icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/__gateway/brand/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
     { "src": "/__gateway/brand/logo.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
   ]
 }

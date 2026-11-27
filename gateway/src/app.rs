@@ -36,6 +36,8 @@ const INTER_LATIN_EXT: &[u8] = include_bytes!("../assets/vendor/inter-latin-ext-
 const BRAND_LOGO: &str = include_str!("../assets/brand/logo.svg");
 const BRAND_ICON_192: &[u8] = include_bytes!("../assets/brand/icon-192.png");
 const BRAND_ICON_512: &[u8] = include_bytes!("../assets/brand/icon-512.png");
+const BRAND_MASKABLE_192: &[u8] = include_bytes!("../assets/brand/icon-maskable-192.png");
+const BRAND_MASKABLE_512: &[u8] = include_bytes!("../assets/brand/icon-maskable-512.png");
 const BRAND_TOUCH: &[u8] = include_bytes!("../assets/brand/apple-touch-icon.png");
 const BRAND_FAVICON: &[u8] = include_bytes!("../assets/brand/favicon-32.png");
 const BRAND_MANIFEST: &str = include_str!("../assets/brand/manifest.webmanifest");
@@ -611,6 +613,12 @@ async fn route(app: Arc<App>, entrance: Entrance, req: Request<Incoming>) -> Res
         }
         (_, &Method::GET, "/__gateway/brand/icon-512.png") => {
             return asset("image/png", BRAND_ICON_512)
+        }
+        (_, &Method::GET, "/__gateway/brand/icon-maskable-192.png") => {
+            return asset("image/png", BRAND_MASKABLE_192)
+        }
+        (_, &Method::GET, "/__gateway/brand/icon-maskable-512.png") => {
+            return asset("image/png", BRAND_MASKABLE_512)
         }
         // Browsers ask for these at the root on their own; Lattice would answer
         // with its icon (or its page).
