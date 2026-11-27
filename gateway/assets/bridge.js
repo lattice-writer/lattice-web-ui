@@ -43,6 +43,11 @@
 //     new one comes as plain HTTP, not base64 inside Lattice's WebSocket.
 //     When the gateway cannot be sure which file Lattice reads, Lattice is
 //     asked as before.
+// 15. The workspace installs as an app. Chrome and Edge install it in one
+//     click, from a one-time hint or Settings › Install app; Safari, iPhone
+//     and Android without a prompt get their browser's steps. Whether this
+//     browser has it installed, and how the hint was answered, is kept in a
+//     cookie: Lattice copies localStorage between devices.
 (() => {
   "use strict";
 
@@ -587,6 +592,92 @@
     } catch { /* fall back to the browser */ }
     return /^zh\b/i.test(navigator.language || "");
   })();
+  // Only one first-visit hint (installing the app, the phone setup) per page load.
+  const hints = { shown: false, installPending: false };
+
+  // Installing the workspace as an app, shared by the first-visit hints and
+  // Settings' Install app page. Chrome and Edge hold an install prompt for
+  // the page (beforeinstallprompt) that a click can show; Safari and phones
+  // without one get the steps for their browser. Installed is the app's own
+  // window, Chrome's appinstalled, or (Chrome and Edge 140+) the browser
+  // telling a tab of this origin that it has the app.
+  const installApi = (() => {
+    // A cookie, not localStorage: Lattice copies the tab's localStorage to the
+    // host and back (browser-relay.ts), so it would be one answer for every
+    // device, and whether the app is installed belongs to this browser.
+    const KEY = "lattice-web-ui-install";
+    const read = () => {
+      try {
+        const raw = document.cookie.split("; ").find((pair) => pair.startsWith(`${KEY}=`));
+        return raw ? JSON.parse(decodeURIComponent(raw.slice(KEY.length + 1))) : {};
+      } catch { return {}; }
+    };
+    const write = (patch) => {
+      const value = encodeURIComponent(JSON.stringify({ ...read(), ...patch }));
+      document.cookie = `${KEY}=${value}; Path=/; Max-Age=34560000; SameSite=Strict${location.protocol === "https:" ? "; Secure" : ""}`;
+    };
+    const ua = navigator.userAgent;
+    const platform = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? "ios"
+      : /Android/.test(ua) ? "android" : /Macintosh/.test(ua) ? "mac" : "desktop";
+    const browser = /Firefox\/|FxiOS\//.test(ua) ? "firefox"
+      : /Edg\/|EdgA\/|EdgiOS\//.test(ua) ? "edge"
+        : /Chrome\/|Chromium\/|CriOS\//.test(ua) ? "chrome"
+          : /Safari\//.test(ua) ? "safari" : "other";
+    const WINDOW_MODES = ["standalone", "minimal-ui", "window-controls-overlay", "tabbed"].map((mode) => `(display-mode: ${mode})`);
+    let prompt = null;
+    let related = false;
+    let lastWindow = false;
+    const listeners = new Set();
+    const notify = () => { for (const listener of listeners) { try { listener(); } catch { /* one listener's failure */ } } };
+    // The app's own window. Fullscreen (F11, the green button) names no window
+    // mode of its own, so it keeps what the window was before.
+    function appWindow() {
+      if (navigator.standalone === true) return true;
+      if (matchMedia("(display-mode: fullscreen)").matches) return lastWindow;
+      lastWindow = WINDOW_MODES.some((query) => matchMedia(query).matches);
+      return lastWindow;
+    }
+    const api = {
+      platform, browser, listeners,
+      get appWindow() { return appWindow(); },
+      get installed() { return appWindow() || related || read().installed === true; },
+      get canInstall() { return Boolean(prompt) && !api.installed; },
+      // Chrome's own install dialog; resolves "accepted", "dismissed" or "unavailable".
+      async install() {
+        const event = prompt;
+        if (!event || api.installed) return "unavailable";
+        await event.prompt();
+        const { outcome } = await event.userChoice.catch(() => ({ outcome: "dismissed" }));
+        if (prompt === event) prompt = null;
+        if (outcome === "accepted") write({ installed: true });
+        notify();
+        return outcome;
+      },
+      hint: () => read().hint,
+      setHint: (value) => write({ hint: value }),
+    };
+    addEventListener("beforeinstallprompt", (event) => {
+      event.preventDefault();
+      prompt = event;
+      // Chrome offers it only while the app is not installed.
+      write({ installed: false });
+      related = false;
+      notify();
+    });
+    addEventListener("appinstalled", () => { prompt = null; write({ installed: true }); notify(); });
+    for (const query of [...WINDOW_MODES, "(display-mode: fullscreen)"]) matchMedia(query).addEventListener?.("change", notify);
+    if (window.top === window && navigator.getInstalledRelatedApps) {
+      const refresh = () => navigator.getInstalledRelatedApps().then((apps) => {
+        const now = apps.some((app) => app.platform === "webapp");
+        if (!now && related) write({ installed: false });
+        if (now !== related) { related = now; notify(); }
+      }, () => {});
+      refresh();
+      addEventListener("focus", refresh);
+      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });
+    }
+    return api;
+  })();
 
   // The owner's update prompt, built from the markup and classes of Lattice's
   // own notifications (src/telemetry/toast-stack.tsx), so it looks like one.
@@ -666,8 +757,12 @@
       if (detail) {
         const text = document.createElement("p");
         text.className = "app-toast-description";
-        text.title = detail;
-        text.textContent = detail;
+        if (typeof detail === "string") {
+          text.title = detail;
+          text.textContent = detail;
+        } else {
+          text.append(detail);
+        }
         body.append(text);
       }
       if (progress) {
@@ -1032,15 +1127,6 @@
       el("h3", { class: "ui-settings-group-title" }, title),
       el("div", { class: "ui-settings-group-body" }, ...rows));
 
-    function platform() {
-      const ua = navigator.userAgent;
-      if (/iPhone|iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return "ios";
-      if (/Android/.test(ua)) return "android";
-      if (/Macintosh/.test(ua)) return "mac";
-      return "desktop";
-    }
-    let installPrompt = null;
-    addEventListener("beforeinstallprompt", (event) => { event.preventDefault(); installPrompt = event; });
 
     const style = document.createElement("style");
     style.dataset.latticeGateway = "phone-style";
@@ -1051,6 +1137,11 @@
       .modal-dialog-content[data-gateway-dialog] { z-index: 2147483647; }
       [data-gateway-dialog] .settings-content { overflow-y: auto; overscroll-behavior: contain; }
       [data-gateway-dialog] .settings-section { max-width: none; }
+      [data-gateway-page="install"] .install-app-label { display: inline-flex; align-items: center; gap: var(--space-3, 6px); }
+      [data-gateway-page="install"] .install-app-icon { width: 20px; height: 20px; border-radius: 5px; }
+      [data-gateway-page="install"] .install-state { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); font-size: var(--type-caption-size, 12px); }
+      [data-gateway-page="install"] .install-state svg { color: var(--status-success, #2f9e5b); }
+      [data-gateway-page="install"] .install-note { margin: var(--space-3, 6px) var(--space-2, 4px) 0; color: var(--text-tertiary); }
       [data-gateway-page] .phone-badge { margin-inline-start: var(--space-3); padding: 1px 6px; border-radius: 999px; background: var(--control-active-soft); color: var(--control-active); font-size: var(--type-micro-size, 11px); font-weight: var(--weight-semibold, 600); vertical-align: 1px; }
       [data-gateway-page="version"] .version-date { margin-inline-start: var(--space-3, 6px); color: var(--text-tertiary); font-weight: normal; }
       [data-gateway-page="version"] .version-changes { margin: var(--space-2, 4px) 0 0; padding-inline-start: 1.1em; color: var(--text-secondary); font-size: var(--type-caption-size, 12px); line-height: 1.55; }
@@ -1116,15 +1207,8 @@
         pairHint: "A one-time code lets one more device in. It works once and expires in two minutes.",
         pair: "Pair a device", pairScan: "Scan this code on the other device.", copyLink: "Copy link",
         installGroup: "Install the app",
-        thisDevice: "This device",
-        platforms: [
-          ["ios", "iPhone and iPad", "In Safari: Share › Add to Home Screen."],
-          ["android", "Android", "In Chrome: ⋮ › Install app."],
-          ["mac", "Mac", "In Safari: File › Add to Dock. In Chrome: the install icon in the address bar."],
-          ["desktop", "Windows and Linux", "In Chrome or Edge: the install icon in the address bar."],
-        ],
-        install: "Install",
-        appNote: "The installed app keeps its own sign-in. On your tailnet it still opens directly; from the internet, pair it once.",
+        installHint: "One click in Chrome and Edge; the steps for Safari, iPhone and Android are on the Install app page.",
+        installOpen: "Install app…",
         devicesGroup: "Paired devices",
         noDevices: "No devices are paired yet.",
         revoke: "Revoke",
@@ -1157,10 +1241,7 @@
         } finally { pairButton.disabled = false; }
       });
 
-      const here = platform();
-      const installRows = T.platforms.map(([id, name, how]) => row(
-        el("span", {}, name, id === here ? el("span", { class: "phone-badge" }, T.thisDevice) : null), how,
-        id === here && installPrompt ? button(T.install, "tinted", async () => { installPrompt.prompt(); await installPrompt.userChoice.catch(() => {}); installPrompt = null; }) : null));
+      const installRow = row(T.installGroup, T.installHint, button(T.installOpen, "secondary", () => { if (!inSettings) close(); showInstall(); }));
 
       const deviceRows = devices.length
         ? devices.map((device) => {
@@ -1182,7 +1263,7 @@
           row(T.scan, phone.tailnet ? T.scanTailnet : T.scanPublic, phone.qrSvg ? qr(phone.qrSvg) : null),
           row(T.address, el("span", { class: "phone-address" }, address), copyButton),
           row(T.pairLabel, T.pairHint, pairButton)),
-        group(T.installGroup, ...installRows, el("p", { class: "ui-settings-row-description" }, T.appNote)),
+        group(T.installGroup, installRow),
         group(T.devicesGroup, ...deviceRows),
         phone.signedIn ? group(T.browserGroup, row(T.signedInHere, T.signedInHint, button(T.signOut, "secondary", async () => {
           await api("/__gateway/api/logout", {}).catch(() => {});
@@ -1306,7 +1387,62 @@
       notes: (v) => `Open the release notes for ${v}`,
       available: "Updates available",
     };
-    const RELEASES = "https://github.com/lattice-writer/lattice-web-ui/releases";
+    // Steps in this browser when it holds no install prompt.
+    const installSteps = () => {
+      const { platform, browser } = installApi;
+      if (!isSecureContext) return zhUI ? "要通过 HTTPS 打开这个页面才能安装。" : "Open this page over HTTPS to install it.";
+      if (platform === "ios") return zhUI ? "在 Safari 里点「分享」，再选「添加到主屏幕」。" : "In Safari, tap Share, then Add to Home Screen.";
+      if (platform === "android") return zhUI ? "在 Chrome 菜单 ⋮ 里选「安装应用」或「添加到主屏幕」。" : "In Chrome's ⋮ menu, choose Install app or Add to Home screen.";
+      if (browser === "firefox") return zhUI ? "Firefox 电脑版不能安装网页应用，请用 Chrome 或 Edge 打开。" : "Firefox on a computer can't install web apps. Open this page in Chrome or Edge.";
+      if (browser === "safari") return zhUI ? "在 Safari 菜单栏选「文件 › 添加到程序坞」。" : "In Safari's menu bar, choose File › Add to Dock.";
+      return zhUI ? "点地址栏右侧的安装图标，或在浏览器菜单 ⋮ 里选「投放、保存和分享 › 安装 Lattice-web-ui」。" : "Click the install icon at the right of the address bar, or choose Cast, save, and share › Install Lattice-web-ui in the browser's ⋮ menu.";
+    };
+    const I = zhUI ? {
+      nav: "安装应用",
+      title: "安装应用",
+      intro: "把这个工作区装成应用：有自己的窗口，在程序坞、任务栏或主屏幕上有图标，点开就是工作区。",
+      hereGroup: "这台设备",
+      state: {
+        window: () => "正在应用窗口里使用。",
+        installed: () => "已经装在这个浏览器里，从程序坞、开始菜单或应用列表打开。",
+        ready: () => "装好后在单独的窗口里打开，不和浏览器标签页混在一起。",
+        steps: installSteps,
+      },
+      install: "安装",
+      installedBadge: "已安装",
+      othersGroup: "各设备上的安装方法",
+      thisDevice: "这台设备",
+      platforms: [
+        ["mac", "Mac", "Chrome 或 Edge：地址栏右侧的安装图标。Safari：文件 › 添加到程序坞。"],
+        ["desktop", "Windows 和 Linux", "Chrome 或 Edge：地址栏右侧的安装图标。"],
+        ["ios", "iPhone 和 iPad", "Safari：分享 › 添加到主屏幕。"],
+        ["android", "Android", "Chrome：⋮ › 安装应用。"],
+      ],
+      note: "装好的应用有自己的登录状态。在你的 tailnet 里它会直接打开；从公网访问时，需要先配对一次。",
+    } : {
+      nav: "Install app",
+      title: "Install app",
+      intro: "Install this workspace as an app: its own window, an icon in the Dock, the taskbar or on the home screen, and the workspace when it opens.",
+      hereGroup: "This device",
+      state: {
+        window: () => "You're using the app's own window.",
+        installed: () => "Installed in this browser. Open it from the Dock, the Start menu or the app list.",
+        ready: () => "Opens in its own window, apart from the browser's tabs.",
+        steps: installSteps,
+      },
+      install: "Install",
+      installedBadge: "Installed",
+      othersGroup: "How to install, device by device",
+      thisDevice: "This device",
+      platforms: [
+        ["mac", "Mac", "Chrome or Edge: the install icon in the address bar. Safari: File › Add to Dock."],
+        ["desktop", "Windows and Linux", "Chrome or Edge: the install icon in the address bar."],
+        ["ios", "iPhone and iPad", "Safari: Share › Add to Home Screen."],
+        ["android", "Android", "Chrome: ⋮ › Install app."],
+      ],
+      note: "The installed app keeps its own sign-in. On your tailnet it opens directly; from the internet, pair it once.",
+    };
+    const RELEASES ="https://github.com/lattice-writer/lattice-web-ui/releases";
     const GITHUB_MARK = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>';
     const EXTERNAL = '<path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>';
     const REFRESH = '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path>';
@@ -1410,6 +1546,32 @@
       api("/__gateway/api/update").then((state) => updateApi.apply(state)).catch(() => {});
     }
 
+    // "Install app": this device's install (Chrome and Edge's prompt, in one
+    // click), or the steps its browser takes, and the steps on the others.
+    async function showInstall() {
+      const section = el("div", { class: "settings-section" });
+      function render() {
+        const here = installApi.platform;
+        const state = installApi.appWindow ? "window" : installApi.installed ? "installed" : installApi.canInstall ? "ready" : "steps";
+        const control = state === "ready"
+          ? el("button", { type: "button", class: "ui-button ui-button--tinted ui-button--compact", "data-slot": "button", "data-size": "compact", onclick: async (event) => { event.currentTarget.disabled = true; await installApi.install().catch(() => {}); render(); } }, I.install)
+          : state === "window" || state === "installed" ? el("span", { class: "install-state" }, el("span", { html: svg('<path d="M20 6 9 17l-5-5"></path>', 14) }), I.installedBadge) : null;
+        const others = I.platforms.map(([id, name, how]) => row(
+          el("span", {}, name, id === here ? el("span", { class: "phone-badge" }, I.thisDevice) : null), how));
+        section.replaceChildren(
+          el("div", { class: "ui-settings-section-header", "data-slot": "settings-section-header" },
+            el("div", { class: "ui-settings-section-header-copy" },
+              el("h2", { class: "ui-settings-section-header-title" }, I.title),
+              el("p", { class: "ui-settings-section-header-description" }, I.intro))),
+          group(I.hereGroup, row(el("span", { class: "install-app-label" }, el("img", { class: "install-app-icon", src: "/__gateway/brand/icon-192.png", alt: "" }), "Lattice-web-ui"), I.state[state](), control)),
+          group(I.othersGroup, ...others),
+          el("p", { class: "ui-settings-row-description install-note" }, I.note));
+      }
+      render();
+      installApi.listeners.add(render);
+      mount("install", I.title, section, () => installApi.listeners.delete(render));
+    }
+
     // Lattice's own App updates row says Lattice on Linux doesn't update
     // itself; here Lattice-web-ui does, so its row takes that one's place.
     let editorRow = null;
@@ -1453,7 +1615,15 @@
       navStyle.textContent = `
         .settings-nav:has(.settings-search-results) [data-lattice-gateway="settings-group"] { display: none; }
         [data-setting="version"][data-gateway-replaced] { display: none; }
-        .gw-phone .ph-body, .gw-version .up-arrow { transform-box: view-box; transform-origin: 128px 128px; }
+        .gw-phone .ph-body, .gw-version .up-arrow, .gw-install .dl-arrow { transform-box: view-box; transform-origin: 128px 128px; }
+        @keyframes gw-install-drop {
+          0% { transform: translateY(0px); animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
+          24% { transform: translateY(-34px); opacity: 0; animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
+          25% { transform: translateY(-34px); opacity: 1; }
+          58% { transform: translateY(8px); animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
+          78%, 100% { transform: translateY(0px); }
+        }
+        .bakai-icon.is-playing:not(.is-reduced) .gw-install .dl-arrow { animation: gw-install-drop 1s both; }
         @keyframes gw-phone-buzz {
           0% { transform: rotate(0deg); animation-timing-function: cubic-bezier(0.25,0.7,0.2,1); }
           12% { transform: rotate(-14deg); } 24% { transform: rotate(11deg); } 36% { transform: rotate(-8deg); }
@@ -1473,7 +1643,19 @@
       document.head.append(navStyle);
       // Lucide at Lattice's own icons' weight (1.6 at 15px, like its Phosphor set).
       const icon = (paths, size, cls, width = 1.6) => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" class="${cls}" aria-hidden="true">${paths}</svg>`;
-      const navIcon = (kind, paths) => `<span class="animated-product-icon animated-product-icon--gw-${kind}" aria-hidden="true" style="pointer-events: none;"><span class="bakai-icon"><svg width="15" height="15" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" class="gw-${kind}">${paths}</svg></span></span>`;
+      // Phosphor's fill weight, like Lattice's own items (bakai-icons): a solid
+      // glyph, its details knocked out through a mask so they can move.
+      let maskCount = 0;
+      const navIcon = (kind, inner) => `<span class="animated-product-icon animated-product-icon--gw-${kind}" aria-hidden="true" style="pointer-events: none;"><span class="bakai-icon"><svg width="15" height="15" viewBox="0 0 256 256" fill="currentColor" class="gw-${kind}">${inner}</svg></span></span>`;
+      const knockout = (shape, holes) => {
+        const id = `gw-mask-${++maskCount}`;
+        return `<mask id="${id}" maskUnits="userSpaceOnUse" x="0" y="0" width="256" height="256"><rect width="256" height="256" fill="#fff"></rect>${holes}</mask><path d="${shape}" mask="url(#${id})"></path>`;
+      };
+      // Phosphor device-mobile-speaker, app-window and the circle of arrow-circle-up (MIT).
+      const PHONE = '<g class="ph-body"><path d="M176,16H80A24,24,0,0,0,56,40V216a24,24,0,0,0,24,24h96a24,24,0,0,0,24-24V40A24,24,0,0,0,176,16ZM160,64H96a8,8,0,0,1,0-16h64a8,8,0,0,1,0,16Z"></path></g>';
+      const WINDOW = "M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40ZM68,96A12,12,0,1,1,80,84,12,12,0,0,1,68,96Zm40,0a12,12,0,1,1,12-12A12,12,0,0,1,108,96Z";
+      const CIRCLE = "M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Z";
+      const ARROW = (cls, d) => `<g class="${cls}" fill="none" stroke="#000" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">${d}</g>`;
       const replay = (event) => {
         const glyph = event.currentTarget.querySelector(".bakai-icon");
         if (!glyph) return;
@@ -1482,7 +1664,7 @@
         void glyph.offsetWidth;
         glyph.classList.add("is-playing");
       };
-      const item = (kind, label, paths, open, badge = false) => el("button", { type: "button", "data-lattice-gateway": kind === "phone" ? "settings-item" : "settings-version", "data-gateway-page-item": kind, onclick: open, onpointerenter: replay, onfocus: replay,
+      const item = (kind, label, paths, open, badge = false) => el("button", { type: "button", "data-lattice-gateway": { phone: "settings-item", version: "settings-version" }[kind] || `settings-${kind}`, "data-gateway-page-item": kind, onclick: open, onpointerenter: replay, onfocus: replay,
         html: navIcon(kind, paths)
           + `<span title="${label}">${label}</span>`
           + (badge ? `<span class="settings-nav-badge" role="img" aria-label="${V.available}" hidden></span>` : "")
@@ -1496,8 +1678,9 @@
         if (!group) {
           group = el("div", { class: "settings-nav-group", role: "group", "aria-label": "Lattice-web-ui", "data-lattice-gateway": "settings-group" },
             el("div", { class: "settings-nav-group-label" }, "Lattice-web-ui"),
-            item("phone", V.phoneNav, '<g class="ph-body"><rect x="64" y="24" width="128" height="208" rx="16"></rect><path d="M64 56H192"></path><path d="M64 200H192"></path></g>', () => show(true)),
-            item("version", V.nav, '<circle cx="128" cy="128" r="96"></circle><g class="up-arrow"><path d="M94 122L128 88L162 122"></path><path d="M128 168V88"></path></g>', () => showVersion(), true));
+            item("phone", V.phoneNav, PHONE, () => show(true)),
+            item("install", I.nav, knockout(WINDOW, ARROW("dl-arrow", '<path d="M128 118V178"></path><path d="M100 152L128 180L156 152"></path>')), () => showInstall()),
+            item("version", V.nav, knockout(CIRCLE, ARROW("up-arrow", '<path d="M96 120L128 88L160 120"></path><path d="M128 168V92"></path>')), () => showVersion(), true));
           markNav();
         }
         const badge = group.querySelector(".settings-nav-badge");
@@ -1529,8 +1712,11 @@
         if (innerWidth < 700 || standalone) return;
         const phone = await api("/__gateway/api/phone").catch(() => null);
         if (!phone || phone.hintDismissed) return;
-        setTimeout(() => {
-          if (toastApi.busy() || document.querySelector("[data-lattice-gateway=phone]")) return;
+        const phoneHint = () => {
+          // The install hint goes first while the browser may still offer its prompt.
+          if (hints.installPending) { setTimeout(phoneHint, 3000); return; }
+          if (hints.shown || toastApi.busy() || document.querySelector("[data-lattice-gateway=phone]")) return;
+          hints.shown = true;
           const dismiss = () => api("/__gateway/api/phone/hint", {}).catch(() => {});
           toastApi.show({
             title: "Use this workspace on your phone",
@@ -1541,9 +1727,95 @@
               { label: "Don't show again", run: () => { dismiss(); toastApi.close(); } },
             ],
           });
-        }, 9000);
+        };
+        setTimeout(phoneHint, 9000);
       })
       .catch(() => {});
+
+    // Once per browser, unless it is closed for a while or for good: a hint to
+    // install the app. Chrome and Edge install in one click; Safari, iPhone
+    // and an Android browser without a prompt get the steps. Never in the
+    // installed app, nor where no browser can install (Firefox on a computer).
+    (() => {
+      const H = zhUI ? {
+        desktopTitle: "把 Lattice-web-ui 装成桌面应用",
+        desktopDetail: installApi.platform === "mac" ? "单独的窗口，程序坞里有它的图标。" : "单独的窗口，任务栏里有它的图标。",
+        safariDetail: "在 Safari 菜单栏选「文件 › 添加到程序坞」。",
+        phoneTitle: "把 Lattice-web-ui 装到主屏幕",
+        phoneDetail: "从主屏幕点开，全屏，不带浏览器地址栏。",
+        androidSteps: "在 Chrome 菜单 ⋮ 里选「安装应用」。",
+        iosSteps: ["点 ", "「分享」，再选「添加到主屏幕」。"],
+        install: "安装", never: "不再提示", gotIt: "知道了",
+        done: "Lattice-web-ui 已安装",
+        doneDetail: installApi.platform === "android" ? "以后从主屏幕打开它。" : installApi.platform === "mac" ? "以后从程序坞或启动台打开它。" : "以后从开始菜单或应用列表打开它。",
+      } : {
+        desktopTitle: "Install Lattice-web-ui as a desktop app",
+        desktopDetail: installApi.platform === "mac" ? "Its own window, with its icon in the Dock." : "Its own window, with its icon in the taskbar.",
+        safariDetail: "In Safari's menu bar, choose File › Add to Dock.",
+        phoneTitle: "Add Lattice-web-ui to your home screen",
+        phoneDetail: "Open it from the home screen, full screen, without the browser's address bar.",
+        androidSteps: "In Chrome's ⋮ menu, choose Install app.",
+        iosSteps: ["Tap ", " Share, then Add to Home Screen."],
+        install: "Install", never: "Don't show again", gotIt: "Got it",
+        done: "Lattice-web-ui is installed",
+        doneDetail: installApi.platform === "android" ? "Open it from your home screen from now on." : installApi.platform === "mac" ? "Open it from the Dock or Launchpad from now on." : "Open it from the Start menu or the app list from now on.",
+      };
+      const SHARE = '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align: -2px"><path d="M12 3v12"></path><path d="m8 7 4-4 4 4"></path><path d="M8 11H6a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-2"></path></svg>';
+      const phone = installApi.platform === "ios" || installApi.platform === "android";
+      const desktopBrowser = installApi.browser === "chrome" || installApi.browser === "edge";
+      if (!isSecureContext || installApi.appWindow) return;
+      if (!phone && !(desktopBrowser || (installApi.platform === "mac" && installApi.browser === "safari"))) return;
+      const pref = installApi.hint() || {};
+      if (pref.never || (pref.until && pref.until > Date.now())) return;
+      // Chrome on a computer may hold its prompt a while after the page loads.
+      if (!phone && desktopBrowser && !installApi.installed) {
+        hints.installPending = true;
+        setTimeout(() => { hints.installPending = false; }, 20000);
+      }
+      const never = () => { installApi.setHint({ never: true }); toastApi.close(); };
+      const later = () => installApi.setHint({ until: Date.now() + 7 * 24 * 3600 * 1000 });
+      async function install() {
+        open = false;
+        toastApi.close();
+        if (await installApi.install().catch(() => "dismissed") !== "accepted") return;
+        toastApi.show({ title: H.done, detail: H.doneDetail });
+        setTimeout(() => toastApi.close(), 8000);
+      }
+      // Installed some other way (Settings, the browser's own icon): the hint goes.
+      let open = false;
+      installApi.listeners.add(() => { if (open && installApi.installed) { open = false; toastApi.close(); } });
+      function offer() {
+        if (installApi.installed) return;
+        if (hints.shown || toastApi.busy()) return;
+        // Chrome and Edge on a computer: only once the browser holds its prompt.
+        if (!phone && desktopBrowser && !installApi.canInstall) return;
+        hints.shown = true;
+        open = true;
+        if (installApi.canInstall) {
+          toastApi.show({ title: phone ? H.phoneTitle : H.desktopTitle, detail: phone ? H.phoneDetail : H.desktopDetail, onClose: later,
+            actions: [{ label: H.install, run: install }, { label: H.never, run: never }] });
+          return;
+        }
+        let detail = installApi.platform === "android" ? H.androidSteps : H.safariDetail;
+        if (installApi.platform === "ios") {
+          detail = document.createElement("span");
+          const glyph = document.createElement("span");
+          glyph.innerHTML = SHARE;
+          detail.append(H.iosSteps[0], glyph, H.iosSteps[1]);
+        }
+        toastApi.show({ title: phone ? H.phoneTitle : H.desktopTitle, detail, onClose: later, actions: [{ label: H.gotIt, run: never }] });
+      }
+      // After the workspace has settled; Chrome may hold its prompt a little later still.
+      // Tried again while another notification is up, for a minute at most.
+      const started = Date.now();
+      let timer = 0;
+      const tryOffer = () => {
+        if (hints.shown || installApi.installed || Date.now() - started > 60000) { hints.installPending = false; installApi.listeners.delete(tryOffer); clearInterval(timer); return; }
+        if (Date.now() - started >= 6000) offer();
+      };
+      installApi.listeners.add(tryOffer);
+      timer = setInterval(tryOffer, 3000);
+    })();
   })();
 
   // Lattice's message and confirm dialogs, and its Open panels, shown in this

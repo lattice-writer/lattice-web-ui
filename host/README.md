@@ -79,9 +79,7 @@ Settings parts. It has three groups:
 - **Open on your phone.** A QR code for the workspace's address: a phone
   signed in to the same Tailscale account goes straight in. It also offers a
   one-time pairing code for any other phone.
-- **Install the app.** The steps for iPhone and iPad, Android, Mac, and
-  Windows or Linux, with the current device marked. Chrome and Edge get an
-  **Install** button.
+- **Install the app.** A link to **Install app** (below).
 - **Paired devices.** Each device, with **Revoke**.
 
 How to open it:
@@ -101,6 +99,31 @@ as `install` does when it finishes.
 The gateway trusts Tailscale's identity headers only on its Unix sockets, and
 only from tailscaled (root, or `--ingress-uid` for a tailscaled running in a
 container). Requests that come in over TCP never carry an identity.
+
+## Install as an app
+
+The workspace installs as an app: its own window, and an icon in the Dock,
+the taskbar or on the home screen. Settings' **Lattice-web-ui** group has an
+**Install app** page:
+
+- **This device.** In Chrome and Edge, an **Install** button opens the
+  browser's own install dialog. Safari, iPhone and Android browsers that
+  offer no dialog get their steps (File › Add to Dock; Share › Add to Home
+  Screen). Once installed, the page says so.
+- **Every device.** The steps for Mac, Windows and Linux, iPhone and iPad,
+  and Android.
+
+About six seconds after the workspace opens, a browser that can install it
+and has not yet shows a one-time notification. In Chrome and Edge, on a
+computer or on Android, it has an **Install** button; elsewhere it names the
+steps. **Don't show again** ends it for that browser, closing it waits a
+week, and it never appears in the installed app. Only one first-visit hint
+appears per visit; this one comes before the phone-setup hint.
+
+The installed app reuses its open window when launched again or sent a link,
+and Android gets an adaptive icon. Whether a browser has the app is kept in a
+cookie of that browser (Lattice copies localStorage between devices), and the
+gateway keeps that cookie from Lattice.
 
 ## One window
 
